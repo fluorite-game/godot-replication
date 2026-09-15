@@ -116,6 +116,14 @@ pub struct ReplicationApi {
 
 /// A synchronizer and the node it replicates.
 struct Watched {
+    /// Kept so its visibility can be asked each tick.
+    ///
+    /// `public_visibility` is not a rendering flag -- it decides whether this
+    /// synchronizer sends to peers at all. `red_robot.tscn` sets it false on
+    /// all three death-part synchronizers (lines 10844, 10895, 10947) and
+    /// `part.gd:31` sets it true when the part explodes, so a robot's debris
+    /// is silent on the wire until it is actually flying.
+    sync: Gd<MultiplayerSynchronizer>,
     object: Gd<Object>,
     /// The mode-ALWAYS properties, in the order `replication_config` lists
     /// them -- which is the order they go on the wire.
@@ -286,7 +294,20 @@ impl ReplicationApi {
         // Net ids are placeholders until the path cache is implemented; the
         // shape and the field encoding are what this exercises.
         for (index, watched) in self.watched.iter().enumerate() {
-            if !watched.object.is_instance_valid() {
+            if !watched.object.is_instance_valid() || !watched.sync.is_instance_valid() {
+                continue;
+            }
+            // Invisible synchronizers send nothing. Measured before it was
+            // implemented: a capture of two peers playing contains 7, 9, 10 or
+            // 11 records per packet, and the composition is always 1 input + 2
+            // players + 4 robots + however many bullets are in the air. Not one
+            // packet in 13901 carries a death part, because nothing died and
+            // their visibility was never turned on.
+            //
+            // This is also why there is no packet-split rule to implement. The
+            // size varies with the number of live bullets, not with a cap --
+            // the largest observed is 877 bytes, far under any MTU.
+            if !watched.sync.is_visibility_public() {
                 continue;
             }
             let fields = Self::read(&watched.object, &watched.streamed);
@@ -351,7 +372,11 @@ impl ReplicationApi {
             );
             self.reported.push(key);
         }
-        self.watched.push(Watched { object, streamed });
+        self.watched.push(Watched {
+            sync: sync.clone(),
+            object,
+            streamed,
+        });
     }
 
     /// Reads the current value of each path off the node.

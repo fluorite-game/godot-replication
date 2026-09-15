@@ -1,0 +1,26 @@
+; Makes Godot load the replication extension (plan.md DR-7).
+;
+; The library path points into the workspace's build output, which is
+; gitignored: this is a development manifest, not a shipping one. A shipping
+; addon would carry a release .so per platform under an addons/ directory.
+;
+; compatibility_minimum is 4.5 because the protocol it implements was measured
+; against 4.5.2 and is an engine internal with no cross-version promise.
+;
+; A headless Godot does not scan the filesystem for these -- it reads
+; `.godot/extension_list.cfg`, which the editor writes and which is gitignored.
+; So on a fresh clone, after `cargo build -p godot_replication_ext`:
+;
+;   echo res://net/godot/replication.gdextension > .godot/extension_list.cfg
+;
+; Without it the extension silently does not load and `ClassDB.class_exists`
+; returns false, which is what `tools/replication_ext_probe.gd` checks first.
+
+[configuration]
+entry_symbol = "gdext_rust_init"
+compatibility_minimum = 4.5
+reloadable = false
+
+[libraries]
+linux.debug.x86_64 = "res://net/target/debug/libgodot_replication_ext.so"
+linux.release.x86_64 = "res://net/target/release/libgodot_replication_ext.so"

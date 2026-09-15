@@ -1,0 +1,17 @@
+[package]
+name = "godot_replication_ext"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.94"
+license = "Apache-2.0"
+description = "A MultiplayerAPIExtension that speaks Godot's own replication protocol"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+godot_replication = { path = "../replication" }
+# api-4-5 matches config/features in project.godot. Pinned rather than left to
+# the default: the protocol this implements is an engine internal, so the
+# binding's idea of the engine and the capture's have to be the same engine.
+godot = { version = "0.5.5", features = ["api-4-5"] }

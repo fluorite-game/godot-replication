@@ -1,0 +1,19 @@
+[package]
+name = "godot_replication"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.94"
+license = "Apache-2.0"
+description = "Godot 4.5 high-level multiplayer protocol: Variant codec, RPC numbering, SYNC framing"
+
+[dependencies]
+# For the RPC-config hash only. Hand-rolling MD5 to avoid one dependency would
+# be trading a reviewed implementation for an unreviewed one, in the single
+# place where being subtly wrong desynchronizes every remote call.
+md-5 = "0.10"
+
+[lints.rust]
+missing_docs = "warn"
+
+[lints.clippy]
+pedantic = "warn"

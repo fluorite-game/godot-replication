@@ -61,10 +61,13 @@
 //! single-peer session, which are the same two the packet captures show.
 
 use godot::classes::{
-    IMultiplayerApiExtension, MultiplayerApiExtension, MultiplayerPeer, OfflineMultiplayerPeer,
+    IMultiplayerApiExtension, MultiplayerApiExtension, MultiplayerPeer, MultiplayerSynchronizer,
+    OfflineMultiplayerPeer,
 };
 use godot::global::Error as GodotError;
 use godot::prelude::*;
+use godot_replication::sync::{encode, SyncPacket, SyncRecord};
+use godot_replication::variant::Value;
 
 struct ReplicationExtension;
 
@@ -104,6 +107,25 @@ pub struct ReplicationApi {
     polls: u64,
     registrations: u64,
     rpcs: u64,
+    /// One per synchronizer the engine has handed over.
+    watched: Vec<Watched>,
+    /// Reported once each, because a shape repeats four times over for the
+    /// robots and a line per registration says the same thing four times.
+    reported: Vec<String>,
+}
+
+/// A synchronizer and the node it replicates.
+struct Watched {
+    object: Gd<Object>,
+    /// The mode-ALWAYS properties, in the order `replication_config` lists
+    /// them -- which is the order they go on the wire.
+    ///
+    /// Mode 0 (NEVER) properties are filtered out here rather than at send
+    /// time: they cross once with the spawn packet, and a SYNC carrying them
+    /// would be traffic the original does not send. The port reached the same
+    /// filter from the `.tscn` files (`net/replication_table.dart`); this
+    /// reaches it from the live objects.
+    streamed: Vec<NodePath>,
 }
 
 #[godot_api]
@@ -131,6 +153,8 @@ impl IMultiplayerApiExtension for ReplicationApi {
             polls: 0,
             registrations: 0,
             rpcs: 0,
+            watched: Vec::new(),
+            reported: Vec::new(),
         }
     }
 
@@ -142,12 +166,14 @@ impl IMultiplayerApiExtension for ReplicationApi {
         // Every hundredth, so a long session leaves a trail without drowning
         // the interesting lines.
         if self.polls.is_multiple_of(100) {
+            let packet = self.build_sync();
             godot_print!(
-                "[replication] polls={} registrations={} rpcs={} peers={:?}",
+                "[replication] polls={} watching={} records={} sync={} bytes rpcs={}",
                 self.polls,
-                self.registrations,
-                self.rpcs,
-                self.peer_ids()
+                self.watched.len(),
+                packet.records.len(),
+                encode(&packet).len(),
+                self.rpcs
             );
         }
         GodotError::OK
@@ -207,17 +233,24 @@ impl IMultiplayerApiExtension for ReplicationApi {
         configuration: Variant,
     ) -> GodotError {
         self.registrations += 1;
-        // The question this version exists to answer. A synchronizer or a
-        // spawner hands itself over here, and what arrives decides how the
-        // real implementation reads the field list.
-        godot_print!(
-            "[replication] configuration_add: object={} configuration={} ({:?})",
-            object
-                .as_ref()
-                .map_or_else(|| "none".to_string(), |o| o.get_class().to_string()),
-            configuration,
-            configuration.get_type()
-        );
+        // The first registration of all is `set_multiplayer()` itself: a null
+        // object and the subtree's NodePath. Everything after is a spawner or
+        // a synchronizer handing itself over, with `object` the node it acts
+        // on.
+        let Some(object) = object else {
+            godot_print!("[replication] configuration_add: subtree {configuration}");
+            return GodotError::OK;
+        };
+        let Ok(sync) = configuration.try_to::<Gd<MultiplayerSynchronizer>>() else {
+            // A MultiplayerSpawner, which is the other kind. Spawn and despawn
+            // are their own packets and their own work.
+            godot_print!(
+                "[replication] configuration_add: spawner for {}",
+                object.get_class()
+            );
+            return GodotError::OK;
+        };
+        self.watch(object, &sync);
         GodotError::OK
     }
 
@@ -237,6 +270,179 @@ impl IMultiplayerApiExtension for ReplicationApi {
 }
 
 impl ReplicationApi {
+    /// Builds the packet this peer would send for the tick just run.
+    ///
+    /// One record per watched synchronizer, in registration order, each
+    /// carrying its mode-ALWAYS properties read fresh off the node. This is
+    /// what `poll` would hand the peer; it is not sent yet, because a send
+    /// without a receive on the other side proves nothing and the receive is
+    /// its own piece of work.
+    ///
+    /// A synchronizer whose node has gone is skipped rather than faulted: the
+    /// demo frees bullets and robots constantly, and a stale entry in this
+    /// list is expected traffic, not an error.
+    fn build_sync(&mut self) -> SyncPacket {
+        let mut records = Vec::new();
+        // Net ids are placeholders until the path cache is implemented; the
+        // shape and the field encoding are what this exercises.
+        for (index, watched) in self.watched.iter().enumerate() {
+            if !watched.object.is_instance_valid() {
+                continue;
+            }
+            let fields = Self::read(&watched.object, &watched.streamed);
+            if fields.is_empty() {
+                continue;
+            }
+            records.push(SyncRecord {
+                net_id: 0x8000_0001 + u32::try_from(index).unwrap_or(0),
+                fields,
+            });
+        }
+        #[allow(clippy::cast_possible_truncation)]
+        SyncPacket {
+            counter: self.polls as u16,
+            records,
+        }
+    }
+
+    /// Takes the field list off a synchronizer and reads it back once.
+    ///
+    /// Reading the values immediately is the check that matters: it proves the
+    /// paths resolve against the object and that every type they yield is one
+    /// the codec handles. A field list recovered but never dereferenced would
+    /// look correct right up to the first packet.
+    fn watch(&mut self, object: Gd<Object>, sync: &Gd<MultiplayerSynchronizer>) {
+        let Some(config) = sync.get_replication_config() else {
+            return;
+        };
+        let mut streamed = Vec::new();
+        let mut modes = Vec::new();
+        let mut config = config;
+        for path in config.get_properties().iter_shared() {
+            let mode = config.property_get_replication_mode(&path);
+            modes.push(format!("{path}={mode:?}"));
+            // ALWAYS is the streaming mode. NEVER rides the spawn.
+            if format!("{mode:?}").contains("ALWAYS") {
+                streamed.push(path);
+            }
+        }
+
+        let values = Self::read(&object, &streamed);
+        let shape: Vec<String> = values
+            .iter()
+            .map(|v| format!("{:?}", v.variant_type()))
+            .collect();
+        let key = format!("{}|{}", object.get_class(), shape.join(","));
+        if !self.reported.contains(&key) {
+            let record = SyncRecord {
+                net_id: 0x8000_0001,
+                fields: values,
+            };
+            let bytes = encode(&SyncPacket {
+                counter: 0,
+                records: vec![record],
+            });
+            godot_print!(
+                "[replication] {} config=[{}] streamed=[{}] -> {} byte record",
+                object.get_class(),
+                modes.join(", "),
+                shape.join(", "),
+                bytes.len()
+            );
+            self.reported.push(key);
+        }
+        self.watched.push(Watched { object, streamed });
+    }
+
+    /// Reads the current value of each path off the node.
+    fn read(object: &Gd<Object>, paths: &[NodePath]) -> Vec<Value> {
+        let mut out = Vec::with_capacity(paths.len());
+        for path in paths {
+            let Some(value) = Self::read_one(object, path) else {
+                godot_error!(
+                    "[replication] {path} does not resolve on {}",
+                    object.get_class()
+                );
+                continue;
+            };
+            if let Some(converted) = Self::convert(&value) {
+                out.push(converted);
+            } else {
+                // Loudly, not silently. A type the codec does not carry means
+                // the packet would be short by a field, and every field after
+                // it would decode from the wrong offset.
+                godot_error!(
+                    "[replication] {path} on {} is {:?}, which the codec does not carry",
+                    object.get_class(),
+                    value.get_type()
+                );
+            }
+        }
+        out
+    }
+
+    /// Resolves one `SceneReplicationConfig` path against the node.
+    ///
+    /// These are two-part paths -- a node part and a property part, separated
+    /// by a colon: `.:global_transform` is a property of the node itself,
+    /// `CameraBase:rotation` a property of a child. `Object::get_indexed`
+    /// takes only the property half; handed the whole path it returns NIL for
+    /// every field, which is what it did until this split existed.
+    ///
+    /// NIL rather than an error is the part worth guarding against. A packet
+    /// built from those reads would have been well-formed and empty, and the
+    /// first sign of trouble would have been a peer that never moved.
+    fn read_one(object: &Gd<Object>, path: &NodePath) -> Option<Variant> {
+        let property = path.get_concatenated_subnames();
+        if property.is_empty() {
+            return None;
+        }
+        let node_part = path.get_concatenated_names().to_string();
+        let target: Gd<Object> = if node_part.is_empty() || node_part == "." {
+            object.clone()
+        } else {
+            object
+                .clone()
+                .try_cast::<Node>()
+                .ok()?
+                .get_node_or_null(&NodePath::from(node_part.as_str()))?
+                .upcast()
+        };
+        Some(target.get_indexed(&NodePath::from(property.to_string().as_str())))
+    }
+
+    /// Godot's Variant to the crate's, for the six types this demo replicates.
+    fn convert(value: &Variant) -> Option<Value> {
+        use godot::builtin::VariantType as T;
+        use godot::builtin::{Transform3D, Vector2, Vector3};
+        Some(match value.get_type() {
+            T::BOOL => Value::Bool(value.to::<bool>()),
+            T::INT => Value::Int(value.to::<i64>()),
+            T::FLOAT => Value::Float(value.to::<f64>()),
+            T::VECTOR2 => {
+                let v = value.to::<Vector2>();
+                Value::Vector2([v.x, v.y])
+            }
+            T::VECTOR3 => {
+                let v = value.to::<Vector3>();
+                Value::Vector3([v.x, v.y, v.z])
+            }
+            T::TRANSFORM3D => {
+                let t = value.to::<Transform3D>();
+                // Row-major, because that is the order Godot's own encoder
+                // writes and its `Basis(x, y, z)` constructor takes columns.
+                // Transposed here, the rotation would be wrong about one axis
+                // only -- which reads as a tuning problem, not an encoding one.
+                let r = t.basis.rows;
+                Value::Transform3D([
+                    r[0].x, r[0].y, r[0].z, r[1].x, r[1].y, r[1].z, r[2].x, r[2].y, r[2].z,
+                    t.origin.x, t.origin.y, t.origin.z,
+                ])
+            }
+            _ => return None,
+        })
+    }
+
     fn peer_ids(&self) -> Vec<i32> {
         // Nothing to enumerate until the real implementation tracks peers; the
         // shape is here so the virtual is not lying about its type.

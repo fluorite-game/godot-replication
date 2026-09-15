@@ -31,7 +31,7 @@
 //! (`health`, `dead`, `player_id`) absent from the stream, as their
 //! replication mode says they should be.
 
-use crate::variant::{decode_compact, Value, VariantError};
+use crate::variant::{decode_compact, encode_compact, Value, VariantError};
 
 /// The `SceneMultiplayer` command byte for a sync packet.
 pub const COMMAND_SYNC: u8 = 0x06;
@@ -148,4 +148,38 @@ pub fn parse(packet: &[u8]) -> Result<SyncPacket, SyncError> {
         });
     }
     Ok(SyncPacket { counter, records })
+}
+
+/// Writes a sync packet back out.
+///
+/// Byte-identical to what Godot sends for the same values: the crate's tests
+/// re-encode 163 captured packets and require the output to match the capture
+/// exactly. That covers the framing, the compact tags, the float encoding, the
+/// vector and transform layouts and the field order -- all of it against bytes
+/// Godot wrote.
+///
+/// It does *not* cover the compact int width rule, and the tests say so rather
+/// than leaving it implied. Every one of the 738 ints in that fixture uses
+/// width code 0, and that is not a thin capture: the only ints the demo
+/// *streams* are `state` and `current_animation`, both small enums. Its one
+/// large int, `player_id`, is replication mode 0 and rides the spawn packet,
+/// so a SYNC stream from this demo can never carry a wider one. Codes 1 to 3
+/// are pinned instead by `tools/capture_sync_probe.sh`, which replicated an
+/// int of each magnitude on purpose, and those bytes are quoted in
+/// `variant`'s unit tests.
+#[must_use]
+pub fn encode(packet: &SyncPacket) -> Vec<u8> {
+    let mut out = vec![COMMAND_SYNC];
+    out.extend_from_slice(&packet.counter.to_le_bytes());
+    for record in &packet.records {
+        let mut body = Vec::new();
+        for field in &record.fields {
+            body.extend_from_slice(&encode_compact(field));
+        }
+        out.extend_from_slice(&record.net_id.to_le_bytes());
+        let length = u32::try_from(body.len()).unwrap_or(u32::MAX);
+        out.extend_from_slice(&length.to_le_bytes());
+        out.extend_from_slice(&body);
+    }
+    out
 }

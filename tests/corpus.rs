@@ -6,7 +6,7 @@
 //! measured. Keeping them here means a change to the codec has to face them
 //! again, on any machine, with no capture tooling installed.
 
-use godot_replication::sync::{parse, SyncPacket};
+use godot_replication::sync::{encode, parse, SyncPacket};
 use godot_replication::variant::{Value, VariantType};
 
 fn fixture_packets() -> Vec<Vec<u8>> {
@@ -115,4 +115,93 @@ fn the_counter_advances() {
         counters.windows(2).any(|w| w[1] != w[0]),
         "the counter is not a constant"
     );
+}
+
+#[test]
+fn re_encoding_a_captured_packet_reproduces_it_byte_for_byte() {
+    // The strongest check available without a second engine in the room. Every
+    // compact tag, every int width, every field order and the record framing
+    // all have to be right for one packet to come back identical -- and these
+    // packets were written by Godot, not by this crate.
+    //
+    // What it does not cover is the int width rule: every int in this fixture
+    // is one byte. See `how_much_of_the_codec_the_fixture_actually_exercises`,
+    // which measures that rather than leaving it to be assumed.
+    let packets = fixture_packets();
+    let mut checked = 0usize;
+    for (index, original) in packets.iter().enumerate() {
+        let decoded = parse(original).expect("parses");
+        let again = encode(&decoded);
+        assert_eq!(
+            again,
+            *original,
+            "packet {index} ({} bytes) did not re-encode identically",
+            original.len()
+        );
+        checked += 1;
+    }
+    assert!(checked > 100, "checked the whole fixture");
+}
+
+#[test]
+fn a_round_trip_survives_a_second_pass() {
+    // Encode/decode being each other's inverse is weaker than matching the
+    // capture, but it catches an encoder and decoder that are wrong in the
+    // same direction -- which matching the capture would also catch, and this
+    // says so sooner and more locally.
+    for packet in fixture_packets() {
+        let once = parse(&packet).expect("parses");
+        let twice = parse(&encode(&once)).expect("re-parses");
+        assert_eq!(once, twice);
+    }
+}
+
+#[test]
+fn how_much_of_the_codec_the_fixture_actually_exercises() {
+    // Honesty check on the re-encode test above. If every int in the capture
+    // fits in one byte then that test proves the framing and the tags but says
+    // nothing about the width rule, and claiming otherwise would be claiming
+    // more than the evidence.
+    use std::collections::BTreeMap;
+    let mut widths: BTreeMap<u8, usize> = BTreeMap::new();
+    let mut types: BTreeMap<&str, usize> = BTreeMap::new();
+    for packet in fixture_packets() {
+        for record in parse(&packet).expect("parses").records {
+            for field in record.fields {
+                let name = match field {
+                    Value::Bool(_) => "bool",
+                    Value::Int(v) => {
+                        *widths
+                            .entry(godot_replication::variant::compact_width_code(v))
+                            .or_default() += 1;
+                        "int"
+                    }
+                    Value::Float(_) => "float",
+                    Value::Vector2(_) => "Vector2",
+                    Value::Vector3(_) => "Vector3",
+                    Value::Transform3D(_) => "Transform3D",
+                };
+                *types.entry(name).or_default() += 1;
+            }
+        }
+    }
+    println!("field types in the fixture: {types:?}");
+    println!("compact int width codes:    {widths:?}");
+    // Every int here is width code 0, and that is a fact about the demo rather
+    // than a thin capture: the only ints it streams are `state` and
+    // `current_animation`, both small enums, while its one large int
+    // (`player_id`) is replication mode 0 and rides the spawn packet. So a
+    // SYNC stream from this demo cannot carry a wider one, and the wider codes
+    // are covered by the probe-derived unit tests in variant.rs instead.
+    //
+    // Asserted so that a future capture which *does* carry a wider int fails
+    // here and forces this note to be re-read, rather than silently widening
+    // what the re-encode test is believed to prove.
+    assert_eq!(
+        widths.keys().copied().collect::<Vec<u8>>(),
+        vec![0],
+        "fixture ints are all one byte; if this changes, revisit what \
+         re_encoding_a_captured_packet_reproduces_it_byte_for_byte covers"
+    );
+    assert_eq!(types.len(), 5, "bool, int, Vector2, Vector3, Transform3D");
 }

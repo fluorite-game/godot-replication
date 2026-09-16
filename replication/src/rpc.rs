@@ -30,6 +30,167 @@
 
 use md5::{Digest, Md5};
 
+/// A remote call on the wire.
+///
+/// # Two forms, and the lead byte says which
+///
+/// ```text
+/// 0x80  [u8 0x80][u8 cache_id][u8 method]                       3 bytes
+/// 0xa0  [u8 0xa0][u32 net_id | 0x8000_0000][u8 method][path][NUL]
+/// ```
+///
+/// The long form is what a sender uses before the receiver has confirmed the
+/// node's path; the short one once `CONFIRM_PATH` has come back. In a capture
+/// of one shooting session the two appear in almost equal numbers -- 108 long
+/// and 106 short -- because bullets are spawned and destroyed constantly and
+/// each new one needs its path announced before its `explode` can be addressed
+/// cheaply.
+///
+/// # Read against the path cache, which names every target
+///
+/// Cache id 5 is `main/Level/SpawnedNodes/466750851`, the client's own player,
+/// so the 106 identical `80 05 04` packets are method 4 of `player.gd` --
+/// which sorted is `shoot`, once per shot. The long form carries method 0 to
+/// nodes whose leaf name starts with `Bullet` 107 times; all of them run
+/// `bullet.gd`, whose single RPC is `explode`. Mostly these are the bullet
+/// nodes themselves rather than the `BulletCache` they came from, because each
+/// new bullet needs its own path announced before it can be addressed cheaply.
+/// Method 3 goes to the player once, which sorted is `land`: a character lands
+/// once after it spawns.
+///
+/// # Arguments are not implemented, because nothing sends any
+///
+/// Every RPC this demo actually calls with `.rpc()` takes no parameters, and
+/// the one that takes a float -- `add_camera_shake_trauma` -- is only ever
+/// called as a plain method (`player.gd:201`, `:206`, `red_robot.gd:133`). So no
+/// captured packet carries an argument list, and there is nothing here to
+/// check an implementation of one against. Writing it now would be a guess
+/// with tests around it. [`RemoteCall::Path`] and [`RemoteCall::Cached`]
+/// therefore stop at the method id, and a packet with trailing bytes is
+/// refused rather than silently ignored.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RemoteCall {
+    /// Addressed by a path-cache id the receiver has confirmed.
+    Cached {
+        /// The node's path-cache id.
+        cache_id: u8,
+        /// Index into the node's sorted RPC method list.
+        method: u8,
+    },
+    /// Addressed by full path, before the cache is confirmed.
+    Path {
+        /// The id the path is being announced under.
+        net_id: u32,
+        /// Index into the node's sorted RPC method list.
+        method: u8,
+        /// The node's path.
+        path: String,
+    },
+}
+
+/// Lead byte of a cached remote call.
+pub const LEAD_CACHED: u8 = 0x80;
+/// Lead byte of a remote call carrying its target's path.
+pub const LEAD_PATH: u8 = 0xa0;
+
+/// Why a remote call could not be read.
+#[derive(Debug, PartialEq, Eq, Clone)]
+pub enum CallError {
+    /// The lead byte was neither [`LEAD_CACHED`] nor [`LEAD_PATH`].
+    UnknownForm {
+        /// What was found.
+        found: u8,
+    },
+    /// The packet ended inside a field.
+    Truncated,
+    /// The path was not NUL-terminated.
+    Unterminated,
+    /// Bytes followed the packet's last known field.
+    ///
+    /// Refused rather than ignored: the only thing that could follow is an
+    /// argument list, which this crate does not implement because no captured
+    /// packet has one. Dropping them would turn an unimplemented feature into
+    /// a call made with the wrong arguments.
+    TrailingBytes {
+        /// How many bytes were left over.
+        count: usize,
+    },
+}
+
+impl RemoteCall {
+    /// Reads one remote call.
+    ///
+    /// # Errors
+    ///
+    /// Any of [`CallError`].
+    pub fn parse(packet: &[u8]) -> Result<Self, CallError> {
+        match packet.first() {
+            Some(&LEAD_CACHED) => {
+                if packet.len() < 3 {
+                    return Err(CallError::Truncated);
+                }
+                if packet.len() > 3 {
+                    return Err(CallError::TrailingBytes {
+                        count: packet.len() - 3,
+                    });
+                }
+                Ok(Self::Cached {
+                    cache_id: packet[1],
+                    method: packet[2],
+                })
+            }
+            Some(&LEAD_PATH) => {
+                let net_id = u32::from_le_bytes(
+                    packet
+                        .get(1..5)
+                        .ok_or(CallError::Truncated)?
+                        .try_into()
+                        .map_err(|_| CallError::Truncated)?,
+                );
+                let method = *packet.get(5).ok_or(CallError::Truncated)?;
+                let rest = packet.get(6..).ok_or(CallError::Truncated)?;
+                let end = rest
+                    .iter()
+                    .position(|&b| b == 0)
+                    .ok_or(CallError::Unterminated)?;
+                if end + 1 != rest.len() {
+                    return Err(CallError::TrailingBytes {
+                        count: rest.len() - end - 1,
+                    });
+                }
+                Ok(Self::Path {
+                    net_id,
+                    method,
+                    path: String::from_utf8_lossy(&rest[..end]).into_owned(),
+                })
+            }
+            Some(&found) => Err(CallError::UnknownForm { found }),
+            None => Err(CallError::Truncated),
+        }
+    }
+
+    /// Writes it back out.
+    #[must_use]
+    pub fn encode(&self) -> Vec<u8> {
+        match self {
+            Self::Cached { cache_id, method } => vec![LEAD_CACHED, *cache_id, *method],
+            Self::Path {
+                net_id,
+                method,
+                path,
+            } => {
+                let mut out = Vec::with_capacity(7 + path.len());
+                out.push(LEAD_PATH);
+                out.extend_from_slice(&net_id.to_le_bytes());
+                out.push(*method);
+                out.extend_from_slice(path.as_bytes());
+                out.push(0);
+                out
+            }
+        }
+    }
+}
+
 /// A node's RPC methods, held in the order the wire numbers them.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct RpcConfig {

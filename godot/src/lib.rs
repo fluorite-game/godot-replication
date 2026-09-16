@@ -146,6 +146,11 @@ pub struct ReplicationApi {
     /// spawner's path id and the first robot's object id are both 1.
     next_net_id: u32,
     spawns_sent: u32,
+    /// Path-cache ids given to spawner nodes, by instance.
+    spawner_ids: Vec<(InstanceId, u32)>,
+    /// Packets received, by command byte. The first of each kind is logged;
+    /// a client syncing at sixty hertz would otherwise bury everything else.
+    incoming: std::collections::BTreeMap<u8, u64>,
     /// Peers this API believes are connected.
     ///
     /// Tracked here because nothing else can: `MultiplayerPeer` has no peer
@@ -159,6 +164,8 @@ pub struct ReplicationApi {
 struct Spawned {
     spawner: Gd<MultiplayerSpawner>,
     node: Gd<Node>,
+    /// Whether the current peers have been sent its SPAWN.
+    sent: bool,
 }
 
 /// A synchronizer and the node it replicates.
@@ -226,6 +233,8 @@ impl IMultiplayerApiExtension for ReplicationApi {
             join_pending: false,
             next_net_id: 1,
             spawns_sent: 0,
+            spawner_ids: Vec::new(),
+            incoming: std::collections::BTreeMap::new(),
         }
     }
 
@@ -239,6 +248,9 @@ impl IMultiplayerApiExtension for ReplicationApi {
         if self.join_pending {
             self.join_pending = false;
             self.send_join();
+        }
+        if self.linked > 0 {
+            self.send_pending_spawns();
         }
         // Every hundredth, so a long session leaves a trail without drowning
         // the interesting lines.
@@ -327,7 +339,11 @@ impl IMultiplayerApiExtension for ReplicationApi {
         };
         if let Ok(spawner) = configuration.try_to::<Gd<MultiplayerSpawner>>() {
             if let Ok(node) = object.try_cast::<Node>() {
-                self.spawned.push(Spawned { spawner, node });
+                self.spawned.push(Spawned {
+                    spawner,
+                    node,
+                    sent: false,
+                });
             }
             return GodotError::OK;
         }
@@ -382,10 +398,24 @@ impl ReplicationApi {
                 watched.cache_id = None;
                 watched.spawn_id = None;
             }
+            for entry in &mut self.spawned {
+                entry.sent = false;
+            }
+            self.spawner_ids.clear();
             self.next_cache_id = 1;
             self.next_net_id = 1;
             self.announced = 0;
             self.join_pending = true;
+        }
+        if now == 0 {
+            // Everyone left. Tell the scripts, as SceneMultiplayer would --
+            // deferred for the same reason peer_connected is.
+            for id in std::mem::take(&mut self.peers) {
+                self.base_mut().call_deferred(
+                    "emit_signal",
+                    &["peer_disconnected".to_variant(), id.to_variant()],
+                );
+            }
         }
         self.linked = now;
     }
@@ -410,13 +440,13 @@ impl ReplicationApi {
         peer.set_target_peer(0);
 
         // Spawner paths, one id each, in first-seen order.
-        let mut spawner_ids: Vec<(InstanceId, u32)> = Vec::new();
-        for entry in &self.spawned {
-            let key = entry.spawner.instance_id();
-            if spawner_ids.iter().any(|(k, _)| *k == key) {
+        for index in 0..self.spawned.len() {
+            let spawner = self.spawned[index].spawner.clone();
+            let key = spawner.instance_id();
+            if self.spawner_ids.iter().any(|(k, _)| *k == key) {
                 continue;
             }
-            let Some(path) = relative_path(&entry.spawner.clone().upcast()) else {
+            let Some(path) = relative_path(&spawner.upcast()) else {
                 continue;
             };
             let id = self.next_cache_id;
@@ -433,16 +463,31 @@ impl ReplicationApi {
                 "[replication] path {id} -> {path} ({} bytes, {sent:?})",
                 bytes.len()
             );
-            spawner_ids.push((key, id));
+            self.spawner_ids.push((key, id));
         }
+    }
 
+    /// Sends a SPAWN for every node the current peers have not been told about.
+    ///
+    /// Run every tick, not only on join, because nodes keep arriving. The
+    /// joining client's own player is the first such: `level.gd` creates it
+    /// from `peer_connected`, which this API emits deferred, so it registers
+    /// a tick after the join sequence and is sent here on the tick after
+    /// that -- once its synchronizers have registered too, which happens
+    /// inside the same `add_child` as the spawner registration.
+    fn send_pending_spawns(&mut self) {
+        let Some(mut peer) = self.peer.clone() else {
+            return;
+        };
+        peer.set_target_peer(0);
         let local = self.get_unique_id();
         for index in 0..self.spawned.len() {
             let entry = &self.spawned[index];
-            if !entry.node.is_instance_valid() {
+            if entry.sent || !entry.node.is_instance_valid() {
                 continue;
             }
-            let Some(&(_, spawner_id)) = spawner_ids
+            let Some(&(_, spawner_id)) = self
+                .spawner_ids
                 .iter()
                 .find(|(k, _)| *k == entry.spawner.instance_id())
             else {
@@ -453,6 +498,7 @@ impl ReplicationApi {
                     "[replication] {} is not in its spawner's scene list",
                     entry.node.get_name()
                 );
+                self.spawned[index].sent = true;
                 continue;
             };
             let node_id = entry.node.instance_id();
@@ -482,6 +528,7 @@ impl ReplicationApi {
                 }
             }
             self.next_net_id = net_id + 1 + u32::try_from(sync_ids.len()).unwrap_or(0);
+            self.spawned[index].sent = true;
 
             let bytes = Spawn {
                 scene,
@@ -512,12 +559,24 @@ impl ReplicationApi {
         let Some(peer) = self.peer.as_mut() else {
             return;
         };
+        let mut arrived = Vec::new();
         while peer.get_available_packet_count() > 0 {
+            // The sender of the *next* packet, so asked before reading it.
+            // This is how a joining peer's id is learned: the transport count
+            // says someone is there, and their first packet -- the
+            // CONFIRM_PATH answering the spawner path -- says who.
+            let from = peer.get_packet_peer();
             let packet = peer.get_packet();
             let bytes = packet.as_slice();
             let Some(&command) = bytes.first() else {
                 continue;
             };
+            if from != 0 && !self.peers.contains(&from) {
+                self.peers.push(from);
+                arrived.push(from);
+            }
+            let seen = self.incoming.entry(command).or_insert(0);
+            *seen += 1;
             if command == COMMAND_CONFIRM_PATH {
                 match ConfirmPath::parse(bytes) {
                     Ok(answer) if answer.valid => {
@@ -535,12 +594,24 @@ impl ReplicationApi {
                         godot_error!("[replication] malformed CONFIRM_PATH: {error:?}");
                     }
                 }
-            } else {
+            } else if *seen == 1 {
                 godot_print!(
-                    "[replication] incoming command {command:#04x}, {} bytes",
+                    "[replication] first incoming command {command:#04x} from {from}, {} bytes",
                     bytes.len()
                 );
             }
+        }
+        for id in arrived {
+            godot_print!("[replication] peer {id} connected");
+            // Deferred, and it has to be. `level.gd` answers this signal by
+            // spawning a player, and `add_child` re-enters this API through
+            // `object_configuration_add` -- which would be a second mutable
+            // borrow while `poll` holds the first. gdext panics on that, as
+            // it did when the peer's own signal was connected directly.
+            self.base_mut().call_deferred(
+                "emit_signal",
+                &["peer_connected".to_variant(), id.to_variant()],
+            );
         }
     }
 

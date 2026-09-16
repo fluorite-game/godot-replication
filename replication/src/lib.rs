@@ -40,6 +40,7 @@
 //! across 17266 captured packets of real gameplay, the `ENet` header's
 //! `COMPRESSED` flag was never set once.
 
+pub mod path;
 pub mod rpc;
 pub mod sync;
 pub mod variant;

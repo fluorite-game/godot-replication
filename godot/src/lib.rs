@@ -60,12 +60,15 @@
 //! `rpc` is reached: `explode` and `land` both arrived in a ten-second
 //! single-peer session, which are the same two the packet captures show.
 
+use godot::classes::multiplayer_peer::ConnectionStatus;
 use godot::classes::{
-    IMultiplayerApiExtension, MultiplayerApiExtension, MultiplayerPeer, MultiplayerSynchronizer,
-    OfflineMultiplayerPeer,
+    ENetMultiplayerPeer, IMultiplayerApiExtension, MultiplayerApiExtension, MultiplayerPeer,
+    MultiplayerSynchronizer, OfflineMultiplayerPeer,
 };
 use godot::global::Error as GodotError;
 use godot::prelude::*;
+use godot_replication::path::{ConfirmPath, SimplifyPath, COMMAND_CONFIRM_PATH};
+use godot_replication::rpc::RpcConfig;
 use godot_replication::sync::{encode, SyncPacket, SyncRecord};
 use godot_replication::variant::Value;
 
@@ -112,6 +115,37 @@ pub struct ReplicationApi {
     /// Reported once each, because a shape repeats four times over for the
     /// robots and a line per registration says the same thing four times.
     reported: Vec<String>,
+    /// Next path-cache id to hand out.
+    ///
+    /// Godot starts at 1 and allocates contiguously -- measured across 112
+    /// captured announcements, whose ids run 1..=n with no gaps.
+    next_cache_id: u32,
+    /// How many paths have been announced, and how many the far side accepted.
+    announced: u32,
+    confirmed: u32,
+    rejected: u32,
+    /// How many peers the transport reported last tick.
+    ///
+    /// Polled rather than taken from the peer's `peer_connected` signal, and
+    /// the reason is worth recording. The signal does fire -- but it fires
+    /// *re-entrantly, from inside `peer.poll()`*, which this class calls while
+    /// `&mut self` is already borrowed by `poll`. gdext's cell catches the
+    /// double borrow and panics, and Godot reports only
+    /// "Error calling from signal 'peer_connected' to callable", which says
+    /// nothing about why. Any `MultiplayerApiExtension` in Rust will hit this.
+    ///
+    /// Reading a count each tick has no such problem, and answers the only
+    /// question this needs answered: is anyone there.
+    linked: i64,
+    /// Whether the one announcement that both trees can resolve has been sent.
+    probed_static: bool,
+    /// Peers this API believes are connected.
+    ///
+    /// Tracked here because nothing else can: `MultiplayerPeer` has no peer
+    /// list, and keeping one is precisely the job of the `MultiplayerAPI` this
+    /// class replaces. `get_peer_ids` is one of the nine virtuals and was
+    /// returning an empty vector until this existed.
+    peers: Vec<i32>,
 }
 
 /// A synchronizer and the node it replicates.
@@ -125,6 +159,12 @@ struct Watched {
     /// is silent on the wire until it is actually flying.
     sync: Gd<MultiplayerSynchronizer>,
     object: Gd<Object>,
+    /// The synchronizer's own path, as the far side must spell it.
+    path: Option<String>,
+    /// The MD5 of its node's sorted RPC method names.
+    rpc_hash: String,
+    /// The id announced for it, once announced.
+    cache_id: Option<u32>,
     /// The mode-ALWAYS properties, in the order `replication_config` lists
     /// them -- which is the order they go on the wire.
     ///
@@ -163,6 +203,13 @@ impl IMultiplayerApiExtension for ReplicationApi {
             rpcs: 0,
             watched: Vec::new(),
             reported: Vec::new(),
+            next_cache_id: 1,
+            announced: 0,
+            confirmed: 0,
+            rejected: 0,
+            peers: Vec::new(),
+            linked: 0,
+            probed_static: false,
         }
     }
 
@@ -171,17 +218,24 @@ impl IMultiplayerApiExtension for ReplicationApi {
         if let Some(peer) = self.peer.as_mut() {
             peer.poll();
         }
+        self.track_peers();
+        self.read_incoming();
+        self.announce_paths();
         // Every hundredth, so a long session leaves a trail without drowning
         // the interesting lines.
         if self.polls.is_multiple_of(100) {
             let packet = self.build_sync();
             godot_print!(
-                "[replication] polls={} watching={} records={} sync={} bytes rpcs={}",
+                "[replication] polls={} watching={} records={} sync={} bytes rpcs={} \
+                 announced={} confirmed={} rejected={}",
                 self.polls,
                 self.watched.len(),
                 packet.records.len(),
                 encode(&packet).len(),
-                self.rpcs
+                self.rpcs,
+                self.announced,
+                self.confirmed,
+                self.rejected
             );
         }
         GodotError::OK
@@ -194,6 +248,8 @@ impl IMultiplayerApiExtension for ReplicationApi {
                 .as_ref()
                 .map_or_else(|| "none".to_string(), |p| p.get_class().to_string())
         );
+        self.peers.clear();
+        self.linked = 0;
         self.peer = multiplayer_peer;
     }
 
@@ -208,7 +264,7 @@ impl IMultiplayerApiExtension for ReplicationApi {
     }
 
     fn get_peer_ids(&self) -> PackedInt32Array {
-        PackedInt32Array::from(self.peer_ids().as_slice())
+        PackedInt32Array::from(self.peers.as_slice())
     }
 
     fn rpc(
@@ -278,6 +334,187 @@ impl IMultiplayerApiExtension for ReplicationApi {
 }
 
 impl ReplicationApi {
+    /// Notices peers arriving and leaving, by counting them.
+    ///
+    /// ENet-specific, and deliberately so for now: `MultiplayerPeer` exposes
+    /// no peer list at all -- keeping one is the job of the `MultiplayerAPI`
+    /// this class replaces, so there is nothing generic to ask. Real peer
+    /// *ids* come later from `get_packet_peer()` on the first packet each one
+    /// sends; a count is enough to decide whether announcing is worth doing.
+    fn track_peers(&mut self) {
+        let Some(peer) = self.peer.as_ref() else {
+            return;
+        };
+        let now = peer
+            .clone()
+            .try_cast::<ENetMultiplayerPeer>()
+            .ok()
+            .and_then(|p| p.get_host())
+            .map_or(0, |h| h.get_peers().len() as i64);
+        if now == self.linked {
+            return;
+        }
+        godot_print!("[replication] transport peers {} -> {now}", self.linked);
+        if now > self.linked {
+            // Someone joined. Everything announced so far went to somebody
+            // else, or to nobody at all, so the table is announced afresh.
+            for watched in &mut self.watched {
+                watched.cache_id = None;
+            }
+            self.next_cache_id = 1;
+            self.announced = 0;
+            self.probed_static = false;
+        }
+        self.linked = now;
+    }
+
+    /// Announces one not-yet-announced synchronizer path per poll.
+    ///
+    /// One at a time on purpose: this is the first thing this extension has
+    /// ever put on a socket, and a burst would make a rejection hard to tie to
+    /// the packet that caused it.
+    ///
+    /// The question it exists to answer is binary. A stock Godot on the far
+    /// side either parses our `SIMPLIFY_PATH` and replies `CONFIRM_PATH` with
+    /// the same id, or it does not -- and that reply is the first evidence
+    /// that bytes written by this crate are bytes the engine accepts.
+    fn announce_paths(&mut self) {
+        let Some(peer) = self.peer.as_mut() else {
+            return;
+        };
+        if peer.get_connection_status() != ConnectionStatus::CONNECTED {
+            return;
+        }
+        // Nobody to announce to. This, not connection status, is the test.
+        // A server reports CONNECTED the moment `create_server` succeeds --
+        // that says the host is up, not that a client is there. Measured the
+        // hard way: nineteen announcements broadcast to an ENet host holding
+        // zero peers, every `put_packet` returning OK, and not one byte on the
+        // wire.
+        if self.linked == 0 {
+            return;
+        }
+        // A node that exists in both trees, announced first.
+        //
+        // Every watched synchronizer lives under `SpawnedNodes`, and a client
+        // has none of them until a SPAWN arrives -- so announcing those first
+        // asks the far side to resolve paths to nodes it has never heard of.
+        // `main/Level/MultiplayerSpawner` is part of `level.tscn` itself and is
+        // therefore present on both sides from load, which makes it the one
+        // announcement whose answer isolates the round trip from everything
+        // still unimplemented.
+        if !self.probed_static {
+            self.probed_static = true;
+            let id = self.next_cache_id;
+            self.next_cache_id += 1;
+            let probe = SimplifyPath {
+                id,
+                path: "main/Level/MultiplayerSpawner".to_owned(),
+                rpc_hash: RpcConfig::default().hash(),
+            };
+            let bytes = probe.encode();
+            peer.set_target_peer(0);
+            let sent = peer.put_packet(&PackedByteArray::from(bytes.as_slice()));
+            godot_print!(
+                "[replication] announced id {id} -> main/Level/MultiplayerSpawner \
+                 (a node both trees have) ({} bytes, {sent:?})",
+                bytes.len()
+            );
+            self.announced += 1;
+            return;
+        }
+        let Some(index) = self.watched.iter().position(|w| w.cache_id.is_none()) else {
+            return;
+        };
+        let Some(path) = self.watched[index].path.clone() else {
+            self.watched[index].cache_id = Some(0);
+            return;
+        };
+
+        let id = self.next_cache_id;
+        self.next_cache_id += 1;
+        let announcement = SimplifyPath {
+            id,
+            path: path.clone(),
+            // A MultiplayerSynchronizer carries no script, so its RPC config
+            // is empty and hashes the empty string -- which is what every
+            // synchronizer path in the capture carries.
+            rpc_hash: self.watched[index].rpc_hash.clone(),
+        };
+        let bytes = announcement.encode();
+        peer.set_target_peer(0); // everyone
+        let sent = peer.put_packet(&PackedByteArray::from(bytes.as_slice()));
+        // What the peer thinks, measured rather than assumed. `put_packet`
+        // returning OK says the call was accepted, not that anything left:
+        // a broadcast with no peers in ENet's own list is a successful
+        // no-op, and that is indistinguishable from a send unless the list
+        // is inspected.
+        if self.announced == 0 {
+            // Kept from the run that found the bug: a send with an empty ENet
+            // peer list is a silent no-op, so the list is worth printing once.
+            let enet_peers = peer
+                .clone()
+                .try_cast::<ENetMultiplayerPeer>()
+                .ok()
+                .and_then(|p| p.get_host())
+                .map_or(-1, |h| h.get_peers().len() as i64);
+            godot_print!(
+                "[replication] first send: status={:?} enet_peers={} api_peers={:?}",
+                peer.get_connection_status(),
+                enet_peers,
+                self.peers
+            );
+        }
+        self.watched[index].cache_id = Some(id);
+        self.announced += 1;
+        godot_print!(
+            "[replication] announced id {id} -> {path} ({} bytes, {sent:?})",
+            bytes.len()
+        );
+    }
+
+    /// Reads whatever the far side sent.
+    ///
+    /// Only `CONFIRM_PATH` is acted on so far; everything else is counted and
+    /// named. A packet type this does not handle is reported rather than
+    /// dropped quietly, because "nothing happened" and "something arrived that
+    /// nobody read" look identical in a log otherwise.
+    fn read_incoming(&mut self) {
+        let Some(peer) = self.peer.as_mut() else {
+            return;
+        };
+        while peer.get_available_packet_count() > 0 {
+            let packet = peer.get_packet();
+            let bytes = packet.as_slice();
+            let Some(&command) = bytes.first() else {
+                continue;
+            };
+            if command == COMMAND_CONFIRM_PATH {
+                match ConfirmPath::parse(bytes) {
+                    Ok(answer) if answer.valid => {
+                        self.confirmed += 1;
+                        godot_print!("[replication] confirmed id {}", answer.id);
+                    }
+                    Ok(answer) => {
+                        // Not a transport failure: the far side could not
+                        // resolve the path, which means the two scene trees
+                        // disagree about what exists.
+                        self.rejected += 1;
+                        godot_error!("[replication] id {} REJECTED by the peer", answer.id);
+                    }
+                    Err(error) => {
+                        godot_error!("[replication] malformed CONFIRM_PATH: {error:?}");
+                    }
+                }
+            } else {
+                godot_print!(
+                    "[replication] incoming command {command:#04x}, {} bytes",
+                    bytes.len()
+                );
+            }
+        }
+    }
+
     /// Builds the packet this peer would send for the tick just run.
     ///
     /// One record per watched synchronizer, in registration order, each
@@ -372,9 +609,26 @@ impl ReplicationApi {
             );
             self.reported.push(key);
         }
+        // The path the far side will resolve. Relative to the scene root, as
+        // every path in the capture is -- `main/Level/...`, with no leading
+        // slash.
+        let path = sync
+            .clone()
+            .upcast::<Node>()
+            .get_path()
+            .to_string()
+            // Captured paths read `main/Level/...`, so they are relative to
+            // the SceneTree root rather than absolute: `/root/` comes off, not
+            // just the leading slash. Getting this wrong announces
+            // `root/main/Level/...`, which the far side cannot resolve.
+            .strip_prefix("/root/")
+            .map(str::to_owned);
         self.watched.push(Watched {
             sync: sync.clone(),
             object,
+            path,
+            rpc_hash: RpcConfig::default().hash(),
+            cache_id: None,
             streamed,
         });
     }
@@ -466,11 +720,5 @@ impl ReplicationApi {
             }
             _ => return None,
         })
-    }
-
-    fn peer_ids(&self) -> Vec<i32> {
-        // Nothing to enumerate until the real implementation tracks peers; the
-        // shape is here so the virtual is not lying about its type.
-        Vec::new()
     }
 }

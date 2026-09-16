@@ -62,15 +62,18 @@
 
 use godot::classes::multiplayer_peer::ConnectionStatus;
 use godot::classes::{
-    ENetMultiplayerPeer, IMultiplayerApiExtension, MultiplayerApiExtension, MultiplayerPeer,
-    MultiplayerSpawner, MultiplayerSynchronizer, OfflineMultiplayerPeer, ResourceUid,
+    ENetMultiplayerPeer, Engine, IMultiplayerApiExtension, MultiplayerApiExtension,
+    MultiplayerPeer, MultiplayerSpawner, MultiplayerSynchronizer, OfflineMultiplayerPeer,
+    ResourceUid, SceneTree,
 };
 use godot::global::Error as GodotError;
 use godot::prelude::*;
-use godot_replication::path::{ConfirmPath, SimplifyPath, COMMAND_CONFIRM_PATH};
+use godot_replication::path::{
+    encode_despawn, ConfirmPath, SimplifyPath, COMMAND_CONFIRM_PATH, COMMAND_SIMPLIFY_PATH,
+};
 use godot_replication::rpc::RpcConfig;
 use godot_replication::spawn::Spawn;
-use godot_replication::sync::{encode, SyncPacket, SyncRecord};
+use godot_replication::sync::{encode, parse as parse_sync, SyncPacket, SyncRecord, COMMAND_SYNC};
 use godot_replication::variant::{encode_compact, Value};
 
 struct ReplicationExtension;
@@ -151,6 +154,15 @@ pub struct ReplicationApi {
     /// Packets received, by command byte. The first of each kind is logged;
     /// a client syncing at sixty hertz would otherwise bury everything else.
     incoming: std::collections::BTreeMap<u8, u64>,
+    /// Paths remote peers have announced to us: (peer, id) -> node.
+    remote_paths: Vec<(i32, u32, Gd<Node>)>,
+    /// SYNC records applied, and refused for coming from a peer that does not
+    /// own the synchronizer.
+    applied: u64,
+    refused: u64,
+    /// Who is calling, while an RPC body runs. See `rpc`.
+    remote_sender: i32,
+    despawns_sent: u32,
     /// Peers this API believes are connected.
     ///
     /// Tracked here because nothing else can: `MultiplayerPeer` has no peer
@@ -166,6 +178,8 @@ struct Spawned {
     node: Gd<Node>,
     /// Whether the current peers have been sent its SPAWN.
     sent: bool,
+    /// The object id that SPAWN gave it, which DESPAWN names.
+    net_id: u32,
 }
 
 /// A synchronizer and the node it replicates.
@@ -235,6 +249,11 @@ impl IMultiplayerApiExtension for ReplicationApi {
             spawns_sent: 0,
             spawner_ids: Vec::new(),
             incoming: std::collections::BTreeMap::new(),
+            remote_paths: Vec::new(),
+            applied: 0,
+            refused: 0,
+            remote_sender: 0,
+            despawns_sent: 0,
         }
     }
 
@@ -258,7 +277,7 @@ impl IMultiplayerApiExtension for ReplicationApi {
             let packet = self.build_sync();
             godot_print!(
                 "[replication] polls={} watching={} records={} sync={} bytes rpcs={} \
-                 announced={} confirmed={} rejected={} spawns_sent={}",
+                 announced={} confirmed={} rejected={} spawns={} despawns={} applied={} refused={}",
                 self.polls,
                 self.watched.len(),
                 packet.records.len(),
@@ -267,7 +286,10 @@ impl IMultiplayerApiExtension for ReplicationApi {
                 self.announced,
                 self.confirmed,
                 self.rejected,
-                self.spawns_sent
+                self.spawns_sent,
+                self.despawns_sent,
+                self.applied,
+                self.refused
             );
         }
         GodotError::OK
@@ -304,23 +326,45 @@ impl IMultiplayerApiExtension for ReplicationApi {
         peer: i32,
         object: Option<Gd<Object>>,
         method: StringName,
-        _args: VarArray,
+        args: VarArray,
     ) -> GodotError {
         self.rpcs += 1;
-        godot_print!(
-            "[replication] rpc -> peer {peer}: {}::{method}",
-            object
-                .as_ref()
-                .map_or_else(|| "?".to_string(), |o| o.get_class().to_string())
-        );
-        // OK rather than an error: an error here makes the caller report a
-        // failure, and nothing is being sent yet either way. What this version
-        // is for is learning which calls arrive.
+        let Some(mut target) = object else {
+            return GodotError::ERR_INVALID_PARAMETER;
+        };
+        let first = format!("rpc {}::{method}", target.get_class());
+        if !self.reported.contains(&first) {
+            godot_print!("[replication] first {first} -> peer {peer}");
+            self.reported.push(first);
+        }
+        let local = self.get_unique_id();
+        // `call_local` is this API's job, not the engine's. A custom
+        // MultiplayerAPI that only sends leaves the local half undone -- and
+        // this demo's gameplay lives in those bodies. Measured before this
+        // existed: `shoot()` starts the fire cooldown, so without the local
+        // call the player fired every frame (1133 bullets in twenty seconds,
+        // against the capture's two a second); `explode()` starts the
+        // animation that frees a bullet, so none ever died and the server
+        // was tracking 1138 live synchronizers.
+        if (peer == 0 || peer == local) && rpc_calls_local(&target, &method) {
+            self.remote_sender = local;
+            // Through the base guard, because the body is GDScript and may call
+            // back into this API: `red_robot.gd:103` asks
+            // `multiplayer.is_server()` inside `hit()`. A plain call would be a
+            // second borrow of `self` and gdext would panic, as it did for
+            // `peer_connected`.
+            {
+                let _reentrant = self.base_mut();
+                target.callv(&method, &args);
+            }
+            self.remote_sender = 0;
+        }
+        // Sending to remote peers is not implemented yet.
         GodotError::OK
     }
 
     fn get_remote_sender_id(&self) -> i32 {
-        0
+        self.remote_sender
     }
 
     fn object_configuration_add(
@@ -343,6 +387,7 @@ impl IMultiplayerApiExtension for ReplicationApi {
                     spawner,
                     node,
                     sent: false,
+                    net_id: 0,
                 });
             }
             return GodotError::OK;
@@ -357,14 +402,36 @@ impl IMultiplayerApiExtension for ReplicationApi {
     fn object_configuration_remove(
         &mut self,
         object: Option<Gd<Object>>,
-        _configuration: Variant,
+        configuration: Variant,
     ) -> GodotError {
-        godot_print!(
-            "[replication] configuration_remove: object={}",
-            object
-                .as_ref()
-                .map_or_else(|| "none".to_string(), |o| o.get_class().to_string())
-        );
+        let Some(object) = object else {
+            return GodotError::OK;
+        };
+        let gone = object.instance_id();
+
+        if let Ok(sync) = configuration.try_to::<Gd<MultiplayerSynchronizer>>() {
+            let key = sync.instance_id();
+            self.watched.retain(|w| w.sync.instance_id() != key);
+            return GodotError::OK;
+        }
+        // A spawned node leaving. Peers that were told it exists are told it is
+        // gone: without this a client keeps every bullet ever fired.
+        let Some(index) = self
+            .spawned
+            .iter()
+            .position(|e| e.node.instance_id() == gone)
+        else {
+            return GodotError::OK;
+        };
+        let entry = self.spawned.remove(index);
+        if entry.sent && self.linked > 0 {
+            if let Some(peer) = self.peer.as_mut() {
+                let bytes = encode_despawn(entry.net_id);
+                peer.set_target_peer(0);
+                peer.put_packet(&PackedByteArray::from(bytes.as_slice()));
+                self.despawns_sent += 1;
+            }
+        }
         GodotError::OK
     }
 }
@@ -529,6 +596,7 @@ impl ReplicationApi {
             }
             self.next_net_id = net_id + 1 + u32::try_from(sync_ids.len()).unwrap_or(0);
             self.spawned[index].sent = true;
+            self.spawned[index].net_id = net_id;
 
             let bytes = Spawn {
                 scene,
@@ -559,15 +627,20 @@ impl ReplicationApi {
         let Some(peer) = self.peer.as_mut() else {
             return;
         };
-        let mut arrived = Vec::new();
+        // Drained first and handled after, so that handling can call back
+        // into `self` without holding the peer borrow.
+        let mut packets = Vec::new();
         while peer.get_available_packet_count() > 0 {
             // The sender of the *next* packet, so asked before reading it.
             // This is how a joining peer's id is learned: the transport count
             // says someone is there, and their first packet -- the
             // CONFIRM_PATH answering the spawner path -- says who.
             let from = peer.get_packet_peer();
-            let packet = peer.get_packet();
-            let bytes = packet.as_slice();
+            packets.push((from, peer.get_packet().to_vec()));
+        }
+
+        let mut arrived = Vec::new();
+        for (from, bytes) in packets {
             let Some(&command) = bytes.first() else {
                 continue;
             };
@@ -575,30 +648,20 @@ impl ReplicationApi {
                 self.peers.push(from);
                 arrived.push(from);
             }
-            let seen = self.incoming.entry(command).or_insert(0);
-            *seen += 1;
-            if command == COMMAND_CONFIRM_PATH {
-                match ConfirmPath::parse(bytes) {
-                    Ok(answer) if answer.valid => {
-                        self.confirmed += 1;
-                        godot_print!("[replication] confirmed id {}", answer.id);
-                    }
-                    Ok(answer) => {
-                        // Not a transport failure: the far side could not
-                        // resolve the path, which means the two scene trees
-                        // disagree about what exists.
-                        self.rejected += 1;
-                        godot_error!("[replication] id {} REJECTED by the peer", answer.id);
-                    }
-                    Err(error) => {
-                        godot_error!("[replication] malformed CONFIRM_PATH: {error:?}");
-                    }
-                }
-            } else if *seen == 1 {
-                godot_print!(
+            let seen = {
+                let count = self.incoming.entry(command).or_insert(0);
+                *count += 1;
+                *count
+            };
+            match command {
+                COMMAND_CONFIRM_PATH => self.on_confirm_path(&bytes),
+                COMMAND_SIMPLIFY_PATH => self.on_simplify_path(from, &bytes),
+                COMMAND_SYNC => self.on_sync(from, &bytes, seen == 1),
+                _ if seen == 1 => godot_print!(
                     "[replication] first incoming command {command:#04x} from {from}, {} bytes",
                     bytes.len()
-                );
+                ),
+                _ => {}
             }
         }
         for id in arrived {
@@ -612,6 +675,135 @@ impl ReplicationApi {
                 "emit_signal",
                 &["peer_connected".to_variant(), id.to_variant()],
             );
+        }
+    }
+
+    fn on_confirm_path(&mut self, bytes: &[u8]) {
+        match ConfirmPath::parse(bytes) {
+            Ok(answer) if answer.valid => {
+                self.confirmed += 1;
+                godot_print!("[replication] confirmed id {}", answer.id);
+            }
+            Ok(answer) => {
+                // Not a transport failure: the far side could not resolve the
+                // path, which means the two scene trees disagree about what
+                // exists.
+                self.rejected += 1;
+                godot_error!("[replication] id {} REJECTED by the peer", answer.id);
+            }
+            Err(error) => godot_error!("[replication] malformed CONFIRM_PATH: {error:?}"),
+        }
+    }
+
+    /// A peer names one of its nodes. Resolve it here and say whether we can.
+    fn on_simplify_path(&mut self, from: i32, bytes: &[u8]) {
+        let announced = match SimplifyPath::parse(bytes) {
+            Ok(a) => a,
+            Err(error) => {
+                godot_error!("[replication] malformed SIMPLIFY_PATH from {from}: {error:?}");
+                return;
+            }
+        };
+        let node = scene_root()
+            .and_then(|root| root.get_node_or_null(&NodePath::from(announced.path.as_str())));
+        // The hash is the other half of the agreement: both ends must number
+        // this node's RPCs the same way. A mismatch is reported, not guessed
+        // around -- it means the two builds do not run the same script.
+        if let Some(node) = node.as_ref() {
+            let ours = script_rpc_hash(node);
+            if ours != announced.rpc_hash {
+                godot_error!(
+                    "[replication] {} from {from}: rpc hash {} but ours is {ours}",
+                    announced.path,
+                    announced.rpc_hash
+                );
+            }
+        }
+        let valid = node.is_some();
+        godot_print!(
+            "[replication] peer {from} announced id {} -> {} ({})",
+            announced.id,
+            announced.path,
+            if valid { "resolved" } else { "NOT FOUND" }
+        );
+        if let Some(node) = node {
+            self.remote_paths
+                .retain(|(p, id, _)| !(*p == from && *id == announced.id));
+            self.remote_paths.push((from, announced.id, node));
+        }
+        let reply = ConfirmPath {
+            id: announced.id,
+            valid,
+        }
+        .encode();
+        if let Some(peer) = self.peer.as_mut() {
+            peer.set_target_peer(from);
+            peer.put_packet(&PackedByteArray::from(reply.as_slice()));
+            peer.set_target_peer(0);
+        }
+    }
+
+    /// A peer's synchronizer state. Applied only if that peer owns it.
+    fn on_sync(&mut self, from: i32, bytes: &[u8], first: bool) {
+        let packet = match parse_sync(bytes) {
+            Ok(p) => p,
+            Err(error) => {
+                godot_error!("[replication] malformed SYNC from {from}: {error:?}");
+                return;
+            }
+        };
+        for record in packet.records {
+            // Records a peer sends for its own synchronizers are addressed by
+            // the path id it announced, with the top bit set.
+            if record.net_id & 0x8000_0000 == 0 {
+                continue;
+            }
+            let id = record.net_id & 0x7fff_ffff;
+            let Some(node) = self
+                .remote_paths
+                .iter()
+                .find(|(p, i, _)| *p == from && *i == id)
+                .map(|(_, _, n)| n.instance_id())
+            else {
+                continue;
+            };
+            let Some(watched) = self
+                .watched
+                .iter()
+                .find(|w| w.sync.is_instance_valid() && w.sync.instance_id() == node)
+            else {
+                continue;
+            };
+            // The authority check SceneMultiplayer makes: a peer may only
+            // write the synchronizers it owns. Without it any client could
+            // move any robot.
+            if watched.sync.get_multiplayer_authority() != from {
+                self.refused += 1;
+                continue;
+            }
+            if record.fields.len() != watched.streamed.len() {
+                godot_error!(
+                    "[replication] sync from {from}: {} fields for {} properties",
+                    record.fields.len(),
+                    watched.streamed.len()
+                );
+                continue;
+            }
+            let object = watched.object.clone();
+            let paths = watched.streamed.clone();
+            if first {
+                godot_print!(
+                    "[replication] first sync from {from}: {} fields -> {}",
+                    record.fields.len(),
+                    watched.sync.get_name()
+                );
+            }
+            for (path, value) in paths.iter().zip(&record.fields) {
+                if let Some((mut target, property)) = resolve(&object, path) {
+                    target.set_indexed(&property, &to_variant(value));
+                }
+            }
+            self.applied += 1;
         }
     }
 
@@ -766,22 +958,8 @@ impl ReplicationApi {
     /// built from those reads would have been well-formed and empty, and the
     /// first sign of trouble would have been a peer that never moved.
     fn read_one(object: &Gd<Object>, path: &NodePath) -> Option<Variant> {
-        let property = path.get_concatenated_subnames();
-        if property.is_empty() {
-            return None;
-        }
-        let node_part = path.get_concatenated_names().to_string();
-        let target: Gd<Object> = if node_part.is_empty() || node_part == "." {
-            object.clone()
-        } else {
-            object
-                .clone()
-                .try_cast::<Node>()
-                .ok()?
-                .get_node_or_null(&NodePath::from(node_part.as_str()))?
-                .upcast()
-        };
-        Some(target.get_indexed(&NodePath::from(property.to_string().as_str())))
+        let (target, property) = resolve(object, path)?;
+        Some(target.get_indexed(&property))
     }
 
     /// Godot's Variant to the crate's, for the six types this demo replicates.
@@ -847,4 +1025,97 @@ fn scene_index(spawner: &Gd<MultiplayerSpawner>, node: &Gd<Node>) -> Option<u8> 
         };
         (resolved == want).then(|| u8::try_from(i).ok()).flatten()
     })
+}
+
+/// Splits a `SceneReplicationConfig` path into the object it names and the
+/// property on it.
+///
+/// These are two-part paths -- a node part and a property part either side of
+/// a colon: `.:global_transform` is a property of the node itself,
+/// `CameraBase:rotation` one of a child. `Object::get_indexed` takes only the
+/// property half; handed the whole path it returns NIL for every field, which
+/// is what it did until this split existed.
+fn resolve(object: &Gd<Object>, path: &NodePath) -> Option<(Gd<Object>, NodePath)> {
+    let property = path.get_concatenated_subnames();
+    if property.is_empty() {
+        return None;
+    }
+    let node_part = path.get_concatenated_names().to_string();
+    let target: Gd<Object> = if node_part.is_empty() || node_part == "." {
+        object.clone()
+    } else {
+        object
+            .clone()
+            .try_cast::<Node>()
+            .ok()?
+            .get_node_or_null(&NodePath::from(node_part.as_str()))?
+            .upcast()
+    };
+    Some((target, NodePath::from(property.to_string().as_str())))
+}
+
+/// The crate's Variant back to Godot's.
+fn to_variant(value: &Value) -> Variant {
+    use godot::builtin::{Basis, Transform3D, Vector2, Vector3};
+    match *value {
+        Value::Bool(v) => v.to_variant(),
+        Value::Int(v) => v.to_variant(),
+        Value::Float(v) => v.to_variant(),
+        Value::Vector2([x, y]) => Vector2::new(x, y).to_variant(),
+        Value::Vector3([x, y, z]) => Vector3::new(x, y, z).to_variant(),
+        Value::Transform3D(m) => Transform3D::new(
+            // Row-major, the order the encoder writes.
+            Basis::from_rows(
+                Vector3::new(m[0], m[1], m[2]),
+                Vector3::new(m[3], m[4], m[5]),
+                Vector3::new(m[6], m[7], m[8]),
+            ),
+            Vector3::new(m[9], m[10], m[11]),
+        )
+        .to_variant(),
+    }
+}
+
+/// The SceneTree root, which remote paths are relative to.
+fn scene_root() -> Option<Gd<Node>> {
+    Engine::singleton()
+        .get_main_loop()?
+        .try_cast::<SceneTree>()
+        .ok()?
+        .get_root()
+        .map(Gd::upcast)
+}
+
+/// The RPC-config hash of the script a node runs, or of no script.
+fn script_rpc_hash(node: &Gd<Node>) -> String {
+    let Some(script) = node.get_script() else {
+        return RpcConfig::default().hash();
+    };
+    let config = script.get_rpc_config();
+    let names: Vec<String> = config
+        .call("keys", &[])
+        .try_to::<VarArray>()
+        .map(|keys| keys.iter_shared().map(|k| k.to_string()).collect())
+        .unwrap_or_default();
+    RpcConfig::new(names).hash()
+}
+
+/// Whether `method` on `object` is declared `@rpc(..., "call_local")`.
+///
+/// Read from the script's own config, the same source the RPC hash comes from.
+/// Per-node overrides set with `rpc_config()` are not consulted: this demo
+/// declares everything with the annotation and sets none.
+fn rpc_calls_local(object: &Gd<Object>, method: &StringName) -> bool {
+    let Some(script) = object.get_script() else {
+        return false;
+    };
+    let config = script.get_rpc_config();
+    let entry = config.call("get", &[method.to_variant()]);
+    if entry.is_nil() {
+        return false;
+    }
+    entry
+        .call("get", &["call_local".to_variant(), false.to_variant()])
+        .try_to::<bool>()
+        .unwrap_or(false)
 }

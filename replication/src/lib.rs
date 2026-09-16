@@ -42,5 +42,6 @@
 
 pub mod path;
 pub mod rpc;
+pub mod spawn;
 pub mod sync;
 pub mod variant;

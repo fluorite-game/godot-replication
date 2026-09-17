@@ -35,16 +35,29 @@ use md5::{Digest, Md5};
 /// # Two forms, and the lead byte says which
 ///
 /// ```text
-/// 0x80  [u8 0x80][u8 cache_id][u8 method]                       3 bytes
-/// 0xa0  [u8 0xa0][u32 net_id | 0x8000_0000][u8 method][path][NUL]
+/// 0x80  [u8 0x80][u8 cache_id][u8 method]                          3 bytes
+/// 0xa0  [u8 0xa0][u32 0x8000_0000 | 6][u8 method][path][NUL]
 /// ```
 ///
 /// The long form is what a sender uses before the receiver has confirmed the
-/// node's path; the short one once `CONFIRM_PATH` has come back. In a capture
-/// of one shooting session the two appear in almost equal numbers -- 108 long
-/// and 106 short -- because bullets are spawned and destroyed constantly and
-/// each new one needs its path announced before its `explode` can be addressed
-/// cheaply.
+/// node's path, and it carries the path itself; the short one names a path id
+/// the receiver has confirmed. In a capture of one shooting session the two
+/// appear in almost equal numbers -- 108 long and 106 short -- because bullets
+/// are spawned and destroyed constantly, and each is exploded before its path
+/// comes back confirmed.
+///
+/// # The long form's 32-bit field is an offset, not an id
+///
+/// With the top bit set, the low 31 bits say *where in the packet the path
+/// starts*. It is `0x80000006` in all 108 captured long calls, across six
+/// different target paths -- a per-node id would differ between them -- and 6
+/// is exactly one lead byte, four for the field and one for the method.
+///
+/// This was first read as a path id, because the one sample examined happened
+/// to target the node announced as id 6. Sending real path ids there was what
+/// exposed it: a stock client logged `Failed to get path from RPC:
+/// ain/Level/SpawnedNodes/Bullet4.`, the path read from a different wrong
+/// offset in each packet.
 ///
 /// # Read against the path cache, which names every target
 ///
@@ -79,8 +92,6 @@ pub enum RemoteCall {
     },
     /// Addressed by full path, before the cache is confirmed.
     Path {
-        /// The id the path is being announced under.
-        net_id: u32,
         /// Index into the node's sorted RPC method list.
         method: u8,
         /// The node's path.
@@ -92,6 +103,12 @@ pub enum RemoteCall {
 pub const LEAD_CACHED: u8 = 0x80;
 /// Lead byte of a remote call carrying its target's path.
 pub const LEAD_PATH: u8 = 0xa0;
+
+/// Where the path starts in a long-form call with no arguments.
+pub const PATH_OFFSET: u32 = 6;
+
+/// The long form's flag that the field below it is a path offset.
+const PATH_FLAG: u32 = 0x8000_0000;
 
 /// Why a remote call could not be read.
 #[derive(Debug, PartialEq, Eq, Clone)]
@@ -105,6 +122,14 @@ pub enum CallError {
     Truncated,
     /// The path was not NUL-terminated.
     Unterminated,
+    /// The long form's path does not start straight after the method id.
+    ///
+    /// Anything between the method and the path would be an argument list,
+    /// which this crate does not implement.
+    UnexpectedOffset {
+        /// The field as read, flag included.
+        field: u32,
+    },
     /// Bytes followed the packet's last known field.
     ///
     /// Refused rather than ignored: the only thing that could follow is an
@@ -140,13 +165,16 @@ impl RemoteCall {
                 })
             }
             Some(&LEAD_PATH) => {
-                let net_id = u32::from_le_bytes(
+                let field = u32::from_le_bytes(
                     packet
                         .get(1..5)
                         .ok_or(CallError::Truncated)?
                         .try_into()
                         .map_err(|_| CallError::Truncated)?,
                 );
+                if field != PATH_FLAG | PATH_OFFSET {
+                    return Err(CallError::UnexpectedOffset { field });
+                }
                 let method = *packet.get(5).ok_or(CallError::Truncated)?;
                 let rest = packet.get(6..).ok_or(CallError::Truncated)?;
                 let end = rest
@@ -159,7 +187,6 @@ impl RemoteCall {
                     });
                 }
                 Ok(Self::Path {
-                    net_id,
                     method,
                     path: String::from_utf8_lossy(&rest[..end]).into_owned(),
                 })
@@ -174,14 +201,10 @@ impl RemoteCall {
     pub fn encode(&self) -> Vec<u8> {
         match self {
             Self::Cached { cache_id, method } => vec![LEAD_CACHED, *cache_id, *method],
-            Self::Path {
-                net_id,
-                method,
-                path,
-            } => {
+            Self::Path { method, path } => {
                 let mut out = Vec::with_capacity(7 + path.len());
                 out.push(LEAD_PATH);
-                out.extend_from_slice(&net_id.to_le_bytes());
+                out.extend_from_slice(&(PATH_FLAG | PATH_OFFSET).to_le_bytes());
                 out.push(*method);
                 out.extend_from_slice(path.as_bytes());
                 out.push(0);

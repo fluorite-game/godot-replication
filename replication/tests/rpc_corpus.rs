@@ -100,3 +100,23 @@ fn trailing_bytes_are_refused_rather_than_ignored() {
     with_args.push(0xff);
     assert!(RemoteCall::parse(&with_args).is_err());
 }
+
+#[test]
+fn the_long_forms_field_is_the_path_offset() {
+    // 0x80000006 in every captured long call, whatever the target. A path id
+    // would vary between the six different nodes these calls address.
+    let mut paths = std::collections::BTreeSet::new();
+    for packet in fixture().iter().filter(|p| p[0] == LEAD_PATH) {
+        assert_eq!(&packet[1..5], &[6, 0, 0, 0x80]);
+        if let RemoteCall::Path { path, .. } = RemoteCall::parse(packet).expect("parses") {
+            // And the path really does start at byte 6.
+            assert_eq!(&packet[6..6 + path.len()], path.as_bytes());
+            paths.insert(path);
+        }
+    }
+    assert_eq!(paths.len(), 6);
+    // A different offset would mean something sits between method and path.
+    let mut moved = vec![LEAD_PATH, 7, 0, 0, 0x80, 0, 0xff];
+    moved.extend_from_slice(b"main/Level\0");
+    assert!(RemoteCall::parse(&moved).is_err());
+}

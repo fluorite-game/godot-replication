@@ -60,7 +60,7 @@
 //! `rpc` is reached: `explode` and `land` both arrived in a ten-second
 //! single-peer session, which are the same two the packet captures show.
 
-use godot::classes::multiplayer_peer::ConnectionStatus;
+use godot::classes::multiplayer_peer::{ConnectionStatus, TransferMode};
 use godot::classes::{
     ENetMultiplayerPeer, Engine, IMultiplayerApiExtension, MultiplayerApiExtension,
     MultiplayerPeer, MultiplayerSpawner, MultiplayerSynchronizer, OfflineMultiplayerPeer,
@@ -71,7 +71,7 @@ use godot::prelude::*;
 use godot_replication::path::{
     encode_despawn, ConfirmPath, SimplifyPath, COMMAND_CONFIRM_PATH, COMMAND_SIMPLIFY_PATH,
 };
-use godot_replication::rpc::RpcConfig;
+use godot_replication::rpc::{RemoteCall, RpcConfig};
 use godot_replication::spawn::Spawn;
 use godot_replication::sync::{encode, parse as parse_sync, SyncPacket, SyncRecord, COMMAND_SYNC};
 use godot_replication::variant::{encode_compact, Value};
@@ -163,6 +163,13 @@ pub struct ReplicationApi {
     /// Who is calling, while an RPC body runs. See `rpc`.
     remote_sender: i32,
     despawns_sent: u32,
+    /// Increments per SYNC packet sent.
+    sync_counter: u16,
+    syncs_sent: u64,
+    last_sync_bytes: usize,
+    /// Nodes this peer has announced for RPCs: instance, path id, confirmed.
+    rpc_paths: Vec<(InstanceId, u32, bool)>,
+    rpcs_sent: u64,
     /// Peers this API believes are connected.
     ///
     /// Tracked here because nothing else can: `MultiplayerPeer` has no peer
@@ -254,6 +261,11 @@ impl IMultiplayerApiExtension for ReplicationApi {
             refused: 0,
             remote_sender: 0,
             despawns_sent: 0,
+            sync_counter: 0,
+            syncs_sent: 0,
+            last_sync_bytes: 0,
+            rpc_paths: Vec::new(),
+            rpcs_sent: 0,
         }
     }
 
@@ -270,19 +282,21 @@ impl IMultiplayerApiExtension for ReplicationApi {
         }
         if self.linked > 0 {
             self.send_pending_spawns();
+            self.send_sync();
         }
         // Every hundredth, so a long session leaves a trail without drowning
         // the interesting lines.
         if self.polls.is_multiple_of(100) {
-            let packet = self.build_sync();
             godot_print!(
-                "[replication] polls={} watching={} records={} sync={} bytes rpcs={} \
-                 announced={} confirmed={} rejected={} spawns={} despawns={} applied={} refused={}",
+                "[replication] polls={} watching={} syncs_sent={} last_sync={} bytes rpcs={} \
+                 rpcs_sent={} announced={} confirmed={} rejected={} spawns={} despawns={} \
+                 applied={} refused={}",
                 self.polls,
                 self.watched.len(),
-                packet.records.len(),
-                encode(&packet).len(),
+                self.syncs_sent,
+                self.last_sync_bytes,
                 self.rpcs,
+                self.rpcs_sent,
                 self.announced,
                 self.confirmed,
                 self.rejected,
@@ -338,6 +352,13 @@ impl IMultiplayerApiExtension for ReplicationApi {
             self.reported.push(first);
         }
         let local = self.get_unique_id();
+        // Remote peers first, then the local call, which is the order
+        // SceneMultiplayer uses. It also matters: a local body can free the
+        // node (a bullet's `explode` leads to exactly that), and its path has
+        // to be read before that happens.
+        if peer != local && self.linked > 0 {
+            self.send_rpc(peer, &target, &method);
+        }
         // `call_local` is this API's job, not the engine's. A custom
         // MultiplayerAPI that only sends leaves the local half undone -- and
         // this demo's gameplay lives in those bodies. Measured before this
@@ -359,7 +380,6 @@ impl IMultiplayerApiExtension for ReplicationApi {
             }
             self.remote_sender = 0;
         }
-        // Sending to remote peers is not implemented yet.
         GodotError::OK
     }
 
@@ -469,6 +489,7 @@ impl ReplicationApi {
                 entry.sent = false;
             }
             self.spawner_ids.clear();
+            self.rpc_paths.clear();
             self.next_cache_id = 1;
             self.next_net_id = 1;
             self.announced = 0;
@@ -683,6 +704,11 @@ impl ReplicationApi {
             Ok(answer) if answer.valid => {
                 self.confirmed += 1;
                 godot_print!("[replication] confirmed id {}", answer.id);
+                for entry in &mut self.rpc_paths {
+                    if entry.1 == answer.id {
+                        entry.2 = true;
+                    }
+                }
             }
             Ok(answer) => {
                 // Not a transport failure: the far side could not resolve the
@@ -807,56 +833,128 @@ impl ReplicationApi {
         }
     }
 
-    /// Builds the packet this peer would send for the tick just run.
+    /// Sends this tick's state for every synchronizer the peers know about.
     ///
-    /// One record per watched synchronizer, in registration order, each
-    /// carrying its mode-ALWAYS properties read fresh off the node. This is
-    /// what `poll` would hand the peer; it is not sent yet, because a send
-    /// without a receive on the other side proves nothing and the receive is
-    /// its own piece of work.
+    /// One record per synchronizer that was listed in a SPAWN, is ours and is
+    /// visible, addressed by its spawn id -- the rules the capture showed. The
+    /// ownership test is what keeps a client's own input from being echoed
+    /// back to it: the server tracks that synchronizer too, but does not own it.
     ///
-    /// A synchronizer whose node has gone is skipped rather than faulted: the
-    /// demo frees bullets and robots constantly, and a stale entry in this
-    /// list is expected traffic, not an error.
-    fn build_sync(&mut self) -> SyncPacket {
+    /// Unreliable, as the capture's `SEND_UNSEQUENCED` commands are: a lost
+    /// state update is replaced by the next one sixty-odd times a second, and
+    /// retransmitting stale positions would be worse than dropping them.
+    ///
+    /// No size cap is applied, because the demo never needs one: packets grow
+    /// with bullets in the air, and the largest captured was 877 bytes.
+    fn send_sync(&mut self) {
+        let local = self.get_unique_id();
         let mut records = Vec::new();
-        for (index, watched) in self.watched.iter().enumerate() {
-            if !watched.object.is_instance_valid() || !watched.sync.is_instance_valid() {
+        for watched in &self.watched {
+            let Some(net_id) = watched.spawn_id else {
                 continue;
-            }
-            // Invisible synchronizers send nothing. Measured before it was
-            // implemented: a capture of two peers playing contains 7, 9, 10 or
-            // 11 records per packet, and the composition is always 1 input + 2
-            // players + 4 robots + however many bullets are in the air. Not one
-            // packet in 13901 carries a death part, because nothing died and
-            // their visibility was never turned on.
-            //
-            // This is also why there is no packet-split rule to implement. The
-            // size varies with the number of live bullets, not with a cap --
-            // the largest observed is 877 bytes, far under any MTU.
-            if !watched.sync.is_visibility_public() {
+            };
+            if !watched.object.is_instance_valid()
+                || !watched.sync.is_instance_valid()
+                || !watched.sync.is_visibility_public()
+                || watched.sync.get_multiplayer_authority() != local
+            {
                 continue;
             }
             let fields = Self::read(&watched.object, &watched.streamed);
             if fields.is_empty() {
                 continue;
             }
-            // A spawned synchronizer is addressed by the id its SPAWN gave it;
-            // anything else by path-cache id with the top bit set. Both read
-            // off the capture: `0x2` is RedRobot's, `0x80000001` the probe's.
-            let net_id = watched.spawn_id.unwrap_or_else(|| {
-                0x8000_0000
-                    | watched
-                        .cache_id
-                        .unwrap_or(u32::try_from(index).unwrap_or(0))
-            });
             records.push(SyncRecord { net_id, fields });
         }
-        #[allow(clippy::cast_possible_truncation)]
-        SyncPacket {
-            counter: self.polls as u16,
-            records,
+        if records.is_empty() {
+            return;
         }
+        let Some(peer) = self.peer.as_mut() else {
+            return;
+        };
+        self.sync_counter = self.sync_counter.wrapping_add(1);
+        let bytes = encode(&SyncPacket {
+            counter: self.sync_counter,
+            records,
+        });
+        peer.set_target_peer(0);
+        peer.set_transfer_mode(TransferMode::UNRELIABLE);
+        peer.put_packet(&PackedByteArray::from(bytes.as_slice()));
+        peer.set_transfer_mode(TransferMode::RELIABLE);
+        self.syncs_sent += 1;
+        self.last_sync_bytes = bytes.len();
+    }
+
+    /// Sends one RPC to remote peers, as the capture shows it done.
+    ///
+    /// The target's path is announced once. Until the peer confirms it, calls
+    /// go in the long form that carries the path (`0xa0`); after, in the
+    /// three-byte cached form (`0x80`). That is why a shooting session in the
+    /// capture has both in nearly equal numbers: the player's path is
+    /// confirmed early and its `shoot` calls are short, while each new bullet
+    /// is exploded before its path comes back confirmed.
+    ///
+    /// The method id is the index in the script's sorted RPC names. Arguments
+    /// are not encoded -- nothing in this demo sends any.
+    fn send_rpc(&mut self, peer_id: i32, target: &Gd<Object>, method: &StringName) {
+        let Ok(node) = target.clone().try_cast::<Node>() else {
+            return;
+        };
+        let Some(path) = relative_path(&node) else {
+            return;
+        };
+        let names = script_rpc_names(&node);
+        let config = RpcConfig::new(names);
+        let Some(method_id) = config
+            .id_of(&method.to_string())
+            .and_then(|i| u8::try_from(i).ok())
+        else {
+            godot_error!("[replication] {path} has no RPC named {method}");
+            return;
+        };
+        let Some(mut peer) = self.peer.clone() else {
+            return;
+        };
+        peer.set_target_peer(peer_id);
+
+        let key = node.instance_id();
+        let known = self
+            .rpc_paths
+            .iter()
+            .find(|e| e.0 == key)
+            .map(|e| (e.1, e.2));
+        let (path_id, confirmed) = if let Some(found) = known {
+            found
+        } else {
+            let id = self.next_cache_id;
+            self.next_cache_id += 1;
+            let bytes = SimplifyPath {
+                id,
+                path: path.clone(),
+                rpc_hash: config.hash(),
+            }
+            .encode();
+            peer.put_packet(&PackedByteArray::from(bytes.as_slice()));
+            self.announced += 1;
+            self.rpc_paths.push((key, id, false));
+            (id, false)
+        };
+
+        let call = match u8::try_from(path_id) {
+            Ok(cache_id) if confirmed => RemoteCall::Cached {
+                cache_id,
+                method: method_id,
+            },
+            // The long form carries the path itself, at a fixed offset.
+            _ => RemoteCall::Path {
+                method: method_id,
+                path,
+            },
+        };
+        let bytes = call.encode();
+        peer.put_packet(&PackedByteArray::from(bytes.as_slice()));
+        peer.set_target_peer(0);
+        self.rpcs_sent += 1;
     }
 
     /// Takes the field list off a synchronizer and reads it back once.
@@ -1086,18 +1184,22 @@ fn scene_root() -> Option<Gd<Node>> {
         .map(Gd::upcast)
 }
 
-/// The RPC-config hash of the script a node runs, or of no script.
-fn script_rpc_hash(node: &Gd<Node>) -> String {
+/// The RPC method names the script a node runs declares.
+fn script_rpc_names(node: &Gd<Node>) -> Vec<String> {
     let Some(script) = node.get_script() else {
-        return RpcConfig::default().hash();
+        return Vec::new();
     };
-    let config = script.get_rpc_config();
-    let names: Vec<String> = config
+    script
+        .get_rpc_config()
         .call("keys", &[])
         .try_to::<VarArray>()
         .map(|keys| keys.iter_shared().map(|k| k.to_string()).collect())
-        .unwrap_or_default();
-    RpcConfig::new(names).hash()
+        .unwrap_or_default()
+}
+
+/// The RPC-config hash of the script a node runs, or of no script.
+fn script_rpc_hash(node: &Gd<Node>) -> String {
+    RpcConfig::new(script_rpc_names(node)).hash()
 }
 
 /// Whether `method` on `object` is declared `@rpc(..., "call_local")`.

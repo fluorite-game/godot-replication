@@ -64,17 +64,18 @@ use godot::classes::multiplayer_peer::{ConnectionStatus, TransferMode};
 use godot::classes::{
     ENetMultiplayerPeer, Engine, IMultiplayerApiExtension, MultiplayerApiExtension,
     MultiplayerPeer, MultiplayerSpawner, MultiplayerSynchronizer, OfflineMultiplayerPeer,
-    ResourceUid, SceneTree,
+    PackedScene, ResourceLoader, ResourceUid, SceneTree,
 };
 use godot::global::Error as GodotError;
 use godot::prelude::*;
 use godot_replication::path::{
-    encode_despawn, ConfirmPath, SimplifyPath, COMMAND_CONFIRM_PATH, COMMAND_SIMPLIFY_PATH,
+    encode_despawn, parse_despawn, ConfirmPath, SimplifyPath, COMMAND_CONFIRM_PATH,
+    COMMAND_DESPAWN, COMMAND_SIMPLIFY_PATH,
 };
-use godot_replication::rpc::{RemoteCall, RpcConfig};
-use godot_replication::spawn::Spawn;
+use godot_replication::rpc::{RemoteCall, RpcConfig, LEAD_CACHED, LEAD_PATH};
+use godot_replication::spawn::{Spawn, COMMAND_SPAWN};
 use godot_replication::sync::{encode, parse as parse_sync, SyncPacket, SyncRecord, COMMAND_SYNC};
-use godot_replication::variant::{encode_compact, Value};
+use godot_replication::variant::{decode_compact, encode_compact, Value};
 
 struct ReplicationExtension;
 
@@ -170,6 +171,12 @@ pub struct ReplicationApi {
     /// Nodes this peer has announced for RPCs: instance, path id, confirmed.
     rpc_paths: Vec<(InstanceId, u32, bool)>,
     rpcs_sent: u64,
+    /// A SPAWN being applied: set before its node is added to the tree, and
+    /// consumed as that node's synchronizers register.
+    pending: Option<Pending>,
+    spawns_received: u32,
+    despawns_received: u32,
+    rpcs_received: u64,
     /// Peers this API believes are connected.
     ///
     /// Tracked here because nothing else can: `MultiplayerPeer` has no peer
@@ -177,6 +184,22 @@ pub struct ReplicationApi {
     /// class replaces. `get_peer_ids` is one of the nine virtuals and was
     /// returning an empty vector until this existed.
     peers: Vec<i32>,
+}
+
+/// A received SPAWN whose node is being added.
+///
+/// Godot matches a spawn's synchronizer ids to synchronizers by registration
+/// order: the source's own error text refers to a "pending spawn" and to a
+/// synchronizer "unable to process the pending spawn since it has no network
+/// ID". So the ids and the state are held here, the node is added, and each
+/// synchronizer that registers for this node takes the next id and its share
+/// of the state.
+struct Pending {
+    node: InstanceId,
+    net_id: u32,
+    sync_ids: std::collections::VecDeque<u32>,
+    state: Vec<u8>,
+    offset: usize,
 }
 
 /// A node that arrived through a spawner.
@@ -204,6 +227,9 @@ struct Watched {
     cache_id: Option<u32>,
     /// Its id in a SPAWN, if one listed it. SYNC addresses it by this.
     spawn_id: Option<u32>,
+    /// Whether the peer has confirmed `cache_id`. A synchronizer addressed by
+    /// path is only synced once it has.
+    path_confirmed: bool,
     /// The `spawn = true` properties, which ride the SPAWN packet.
     spawn_props: Vec<NodePath>,
     /// The mode-ALWAYS properties, in the order `replication_config` lists
@@ -266,6 +292,10 @@ impl IMultiplayerApiExtension for ReplicationApi {
             last_sync_bytes: 0,
             rpc_paths: Vec::new(),
             rpcs_sent: 0,
+            pending: None,
+            spawns_received: 0,
+            despawns_received: 0,
+            rpcs_received: 0,
         }
     }
 
@@ -290,7 +320,7 @@ impl IMultiplayerApiExtension for ReplicationApi {
             godot_print!(
                 "[replication] polls={} watching={} syncs_sent={} last_sync={} bytes rpcs={} \
                  rpcs_sent={} announced={} confirmed={} rejected={} spawns={} despawns={} \
-                 applied={} refused={}",
+                 applied={} refused={} spawns_in={} despawns_in={} rpcs_in={}",
                 self.polls,
                 self.watched.len(),
                 self.syncs_sent,
@@ -303,7 +333,10 @@ impl IMultiplayerApiExtension for ReplicationApi {
                 self.spawns_sent,
                 self.despawns_sent,
                 self.applied,
-                self.refused
+                self.refused,
+                self.spawns_received,
+                self.despawns_received,
+                self.rpcs_received
             );
         }
         GodotError::OK
@@ -403,11 +436,19 @@ impl IMultiplayerApiExtension for ReplicationApi {
         };
         if let Ok(spawner) = configuration.try_to::<Gd<MultiplayerSpawner>>() {
             if let Ok(node) = object.try_cast::<Node>() {
+                // A node we are adding because a peer spawned it is recorded
+                // as already sent, under the peer's object id, so that it is
+                // never spawned back and its DESPAWN can find it.
+                let remote = self
+                    .pending
+                    .as_ref()
+                    .filter(|p| p.node == node.instance_id())
+                    .map(|p| p.net_id);
                 self.spawned.push(Spawned {
                     spawner,
                     node,
-                    sent: false,
-                    net_id: 0,
+                    sent: remote.is_some(),
+                    net_id: remote.unwrap_or(0),
                 });
             }
             return GodotError::OK;
@@ -415,7 +456,9 @@ impl IMultiplayerApiExtension for ReplicationApi {
         let Ok(sync) = configuration.try_to::<Gd<MultiplayerSynchronizer>>() else {
             return GodotError::OK;
         };
+        let object_id = object.instance_id();
         self.watch(object, &sync);
+        self.adopt_pending(object_id);
         GodotError::OK
     }
 
@@ -444,7 +487,12 @@ impl IMultiplayerApiExtension for ReplicationApi {
             return GodotError::OK;
         };
         let entry = self.spawned.remove(index);
-        if entry.sent && self.linked > 0 {
+        let local = self.get_unique_id();
+        if entry.sent
+            && self.linked > 0
+            && entry.spawner.is_instance_valid()
+            && entry.spawner.get_multiplayer_authority() == local
+        {
             if let Some(peer) = self.peer.as_mut() {
                 let bytes = encode_despawn(entry.net_id);
                 peer.set_target_peer(0);
@@ -478,6 +526,20 @@ impl ReplicationApi {
             return;
         }
         godot_print!("[replication] transport peers {} -> {now}", self.linked);
+        // A client's only transport peer is the server, and the server's id is
+        // always 1, so it is known the moment the link is up. A stock client
+        // lists it straight away (`peers=[1]` in its own join report); waiting
+        // for the server's first packet left this one reporting an empty list.
+        let local = self.get_unique_id();
+        if now > 0 && local != 1 && !self.peers.contains(&1) {
+            self.peers.push(1);
+            self.base_mut().call_deferred(
+                "emit_signal",
+                &["peer_connected".to_variant(), 1.to_variant()],
+            );
+            self.base_mut()
+                .call_deferred("emit_signal", &["connected_to_server".to_variant()]);
+        }
         if now > self.linked {
             // Someone joined. Everything announced so far went to somebody
             // else, or to nobody at all, so the table is announced afresh.
@@ -527,9 +589,15 @@ impl ReplicationApi {
         }
         peer.set_target_peer(0);
 
-        // Spawner paths, one id each, in first-seen order.
+        // Spawner paths, one id each, in first-seen order -- for spawners this
+        // peer is the authority of. A client has spawners too (they are part of
+        // `level.tscn`), but nothing to spawn through them.
+        let local = self.get_unique_id();
         for index in 0..self.spawned.len() {
             let spawner = self.spawned[index].spawner.clone();
+            if !spawner.is_instance_valid() || spawner.get_multiplayer_authority() != local {
+                continue;
+            }
             let key = spawner.instance_id();
             if self.spawner_ids.iter().any(|(k, _)| *k == key) {
                 continue;
@@ -678,6 +746,9 @@ impl ReplicationApi {
                 COMMAND_CONFIRM_PATH => self.on_confirm_path(&bytes),
                 COMMAND_SIMPLIFY_PATH => self.on_simplify_path(from, &bytes),
                 COMMAND_SYNC => self.on_sync(from, &bytes, seen == 1),
+                COMMAND_SPAWN => self.on_spawn(from, &bytes),
+                COMMAND_DESPAWN => self.on_despawn(from, &bytes),
+                LEAD_CACHED | LEAD_PATH => self.on_rpc(from, &bytes),
                 _ if seen == 1 => godot_print!(
                     "[replication] first incoming command {command:#04x} from {from}, {} bytes",
                     bytes.len()
@@ -707,6 +778,11 @@ impl ReplicationApi {
                 for entry in &mut self.rpc_paths {
                     if entry.1 == answer.id {
                         entry.2 = true;
+                    }
+                }
+                for watched in &mut self.watched {
+                    if watched.cache_id == Some(answer.id) {
+                        watched.path_confirmed = true;
                     }
                 }
             }
@@ -746,12 +822,15 @@ impl ReplicationApi {
             }
         }
         let valid = node.is_some();
-        godot_print!(
-            "[replication] peer {from} announced id {} -> {} ({})",
-            announced.id,
-            announced.path,
-            if valid { "resolved" } else { "NOT FOUND" }
-        );
+        // Only failures are worth a line each: a shooting session announces
+        // every bullet's path, dozens of them.
+        if !valid {
+            godot_error!(
+                "[replication] peer {from} announced id {} -> {}, which is not here",
+                announced.id,
+                announced.path
+            );
+        }
         if let Some(node) = node {
             self.remote_paths
                 .retain(|(p, id, _)| !(*p == from && *id == announced.id));
@@ -779,25 +858,29 @@ impl ReplicationApi {
             }
         };
         for record in packet.records {
-            // Records a peer sends for its own synchronizers are addressed by
-            // the path id it announced, with the top bit set.
-            if record.net_id & 0x8000_0000 == 0 {
-                continue;
-            }
-            let id = record.net_id & 0x7fff_ffff;
-            let Some(node) = self
-                .remote_paths
-                .iter()
-                .find(|(p, i, _)| *p == from && *i == id)
-                .map(|(_, _, n)| n.instance_id())
-            else {
-                continue;
+            // Two addressings. With the top bit, the path id the sender
+            // announced for that synchronizer; without, the id a SPAWN from
+            // the sender gave it.
+            let watched = if record.net_id & 0x8000_0000 != 0 {
+                let id = record.net_id & 0x7fff_ffff;
+                let Some(node) = self
+                    .remote_paths
+                    .iter()
+                    .find(|(p, i, _)| *p == from && *i == id)
+                    .map(|(_, _, n)| n.instance_id())
+                else {
+                    continue;
+                };
+                self.watched
+                    .iter()
+                    .find(|w| w.sync.is_instance_valid() && w.sync.instance_id() == node)
+            } else {
+                // Spawn ids are the sender's; only one server spawns here.
+                self.watched
+                    .iter()
+                    .find(|w| w.spawn_id == Some(record.net_id) && w.sync.is_instance_valid())
             };
-            let Some(watched) = self
-                .watched
-                .iter()
-                .find(|w| w.sync.is_instance_valid() && w.sync.instance_id() == node)
-            else {
+            let Some(watched) = watched else {
                 continue;
             };
             // The authority check SceneMultiplayer makes: a peer may only
@@ -833,6 +916,244 @@ impl ReplicationApi {
         }
     }
 
+    /// Announces the path of every owned synchronizer no SPAWN listed.
+    ///
+    /// Such a synchronizer can only be synced by path id, and only once the
+    /// peer has confirmed that id. The hash is that synchronizer node's own
+    /// script's: `md5("")` for a plain MultiplayerSynchronizer, `md5("jump")`
+    /// for the InputSynchronizer, which runs `player_input.gd`. Both are what
+    /// the capture carries.
+    fn announce_owned_paths(&mut self, local: i32) {
+        let Some(mut peer) = self.peer.clone() else {
+            return;
+        };
+        for index in 0..self.watched.len() {
+            let watched = &self.watched[index];
+            if watched.spawn_id.is_some()
+                || watched.cache_id.is_some()
+                || !watched.sync.is_instance_valid()
+                || !watched.sync.is_visibility_public()
+                || watched.sync.get_multiplayer_authority() != local
+            {
+                continue;
+            }
+            // Not before the node's spawn has gone out: a peer cannot resolve
+            // a path under a node it has not been told about yet.
+            let owner = watched.sync.clone().upcast::<Node>();
+            let spawned_unsent = self
+                .spawned
+                .iter()
+                .any(|e| !e.sent && e.node.is_instance_valid() && e.node.is_ancestor_of(&owner));
+            if spawned_unsent {
+                continue;
+            }
+            let Some(path) = relative_path(&owner) else {
+                continue;
+            };
+            let id = self.next_cache_id;
+            self.next_cache_id += 1;
+            let bytes = SimplifyPath {
+                id,
+                path,
+                rpc_hash: script_rpc_hash(&owner),
+            }
+            .encode();
+            peer.set_target_peer(0);
+            peer.put_packet(&PackedByteArray::from(bytes.as_slice()));
+            self.announced += 1;
+            self.watched[index].cache_id = Some(id);
+        }
+    }
+
+    /// A peer spawned a node. Instantiate it here.
+    fn on_spawn(&mut self, from: i32, bytes: &[u8]) {
+        let spawn = match Spawn::parse(bytes) {
+            Ok(s) => s,
+            Err(error) => {
+                godot_error!("[replication] malformed SPAWN from {from}: {error:?}");
+                return;
+            }
+        };
+        let Some(spawner) = self
+            .remote_paths
+            .iter()
+            .find(|(p, i, _)| *p == from && *i == spawn.spawner)
+            .and_then(|(_, _, n)| n.clone().try_cast::<MultiplayerSpawner>().ok())
+        else {
+            godot_error!(
+                "[replication] SPAWN {} names spawner {} which peer {from} never announced",
+                spawn.name,
+                spawn.spawner
+            );
+            return;
+        };
+        // Only the spawner's authority may spawn through it.
+        if spawner.get_multiplayer_authority() != from {
+            godot_error!("[replication] peer {from} may not spawn {}", spawn.name);
+            return;
+        }
+        let Some(scene) = spawnable_scene(&spawner, spawn.scene) else {
+            godot_error!("[replication] spawner has no scene {}", spawn.scene);
+            return;
+        };
+        let Some(mut parent) = spawner.get_node_or_null(&spawner.get_spawn_path()) else {
+            return;
+        };
+        let Some(mut node) = scene.instantiate() else {
+            return;
+        };
+        node.set_name(spawn.name.as_str());
+
+        self.pending = Some(Pending {
+            node: node.instance_id(),
+            net_id: spawn.net_id,
+            sync_ids: spawn.sync_ids.iter().copied().collect(),
+            state: spawn.state,
+            offset: 0,
+        });
+        {
+            // Adding the node registers its spawner entry and synchronizers
+            // with this API, re-entrantly.
+            let _reentrant = self.base_mut();
+            parent.add_child(&node);
+        }
+        // Recorded here rather than left to the spawner's registration: a
+        // MultiplayerSpawner only tracks the children it is the authority
+        // for, so on a client it never registers them. Without this entry a
+        // DESPAWN has nothing to match -- measured: 56 spawns in, 0 despawns
+        // applied, and the client's stale bullets colliding by name with new
+        // ones, which Godot then renamed.
+        if !self
+            .spawned
+            .iter()
+            .any(|e| e.node.instance_id() == node.instance_id())
+        {
+            self.spawned.push(Spawned {
+                spawner: spawner.clone(),
+                node: node.clone(),
+                sent: true,
+                net_id: spawn.net_id,
+            });
+        }
+        if let Some(left) = self.pending.take() {
+            if !left.sync_ids.is_empty() || left.offset != left.state.len() {
+                godot_error!(
+                    "[replication] spawn {}: {} synchronizer ids and {} state bytes unused",
+                    spawn.name,
+                    left.sync_ids.len(),
+                    left.state.len() - left.offset
+                );
+            }
+        }
+        self.spawns_received += 1;
+    }
+
+    /// Hands the pending spawn's next synchronizer id and state to the
+    /// synchronizer that just registered, if it belongs to that node.
+    fn adopt_pending(&mut self, object: InstanceId) {
+        let Some(pending) = self.pending.as_mut() else {
+            return;
+        };
+        if pending.node != object {
+            return;
+        }
+        let Some(watched) = self.watched.last_mut() else {
+            return;
+        };
+        let Some(id) = pending.sync_ids.pop_front() else {
+            // Registered, but not listed: a synchronizer the spawning peer
+            // does not own, such as a client's own InputSynchronizer.
+            return;
+        };
+        watched.spawn_id = Some(id);
+        for path in &watched.spawn_props {
+            let Ok((value, next)) = decode_compact(&pending.state, pending.offset) else {
+                godot_error!("[replication] spawn state ends inside {path}");
+                return;
+            };
+            pending.offset = next;
+            if let Some((mut target, property)) = resolve(&watched.object, path) {
+                target.set_indexed(&property, &to_variant(&value));
+            }
+        }
+    }
+
+    /// A peer removed a node it spawned.
+    fn on_despawn(&mut self, from: i32, bytes: &[u8]) {
+        let Ok(net_id) = parse_despawn(bytes) else {
+            return;
+        };
+        let Some(index) = self.spawned.iter().position(|e| {
+            e.sent
+                && e.net_id == net_id
+                && e.spawner.is_instance_valid()
+                && e.spawner.get_multiplayer_authority() == from
+        }) else {
+            return;
+        };
+        let mut entry = self.spawned.remove(index);
+        if entry.node.is_instance_valid() {
+            entry.node.queue_free();
+        }
+        self.despawns_received += 1;
+    }
+
+    /// A peer called a method on one of our nodes.
+    fn on_rpc(&mut self, from: i32, bytes: &[u8]) {
+        let call = match RemoteCall::parse(bytes) {
+            Ok(c) => c,
+            Err(error) => {
+                godot_error!("[replication] malformed RPC from {from}: {error:?}");
+                return;
+            }
+        };
+        let (node, method_id) = match &call {
+            RemoteCall::Cached { cache_id, method } => (
+                self.remote_paths
+                    .iter()
+                    .find(|(p, i, _)| *p == from && *i == u32::from(*cache_id))
+                    .map(|(_, _, n)| n.clone()),
+                *method,
+            ),
+            RemoteCall::Path { method, path } => (
+                scene_root().and_then(|r| r.get_node_or_null(&NodePath::from(path.as_str()))),
+                *method,
+            ),
+        };
+        let Some(node) = node else {
+            return;
+        };
+        let names = script_rpc_names(&node);
+        let Some(method) = RpcConfig::new(names)
+            .method_of(method_id.into())
+            .map(str::to_owned)
+        else {
+            godot_error!("[replication] {} has no RPC {method_id}", node.get_name());
+            return;
+        };
+        let method = StringName::from(method.as_str());
+        // `rpc_mode`: 1 is any peer, 2 is the node's authority only, 0 is off.
+        match rpc_mode(&node.clone().upcast(), &method) {
+            1 => {}
+            2 if node.get_multiplayer_authority() == from => {}
+            mode => {
+                godot_error!(
+                    "[replication] peer {from} may not call {}::{method} (rpc_mode {mode})",
+                    node.get_name()
+                );
+                return;
+            }
+        }
+        self.rpcs_received += 1;
+        self.remote_sender = from;
+        {
+            let _reentrant = self.base_mut();
+            let mut target = node.upcast::<Object>();
+            target.callv(&method, &VarArray::new());
+        }
+        self.remote_sender = 0;
+    }
+
     /// Sends this tick's state for every synchronizer the peers know about.
     ///
     /// One record per synchronizer that was listed in a SPAWN, is ours and is
@@ -848,11 +1169,9 @@ impl ReplicationApi {
     /// with bullets in the air, and the largest captured was 877 bytes.
     fn send_sync(&mut self) {
         let local = self.get_unique_id();
+        self.announce_owned_paths(local);
         let mut records = Vec::new();
         for watched in &self.watched {
-            let Some(net_id) = watched.spawn_id else {
-                continue;
-            };
             if !watched.object.is_instance_valid()
                 || !watched.sync.is_instance_valid()
                 || !watched.sync.is_visibility_public()
@@ -860,6 +1179,15 @@ impl ReplicationApi {
             {
                 continue;
             }
+            // Listed in a SPAWN: its spawn id. Otherwise its confirmed path id
+            // with the top bit -- in the capture, the server's two
+            // BulletCache synchronizers (0x80000002, 0x80000003) and a
+            // client's InputSynchronizer (0x80000001).
+            let net_id = match (watched.spawn_id, watched.cache_id) {
+                (Some(id), _) => id,
+                (None, Some(id)) if watched.path_confirmed => id | 0x8000_0000,
+                _ => continue,
+            };
             let fields = Self::read(&watched.object, &watched.streamed);
             if fields.is_empty() {
                 continue;
@@ -1012,6 +1340,7 @@ impl ReplicationApi {
             object,
             cache_id: None,
             spawn_id: None,
+            path_confirmed: false,
             spawn_props,
             streamed,
         });
@@ -1220,4 +1549,28 @@ fn rpc_calls_local(object: &Gd<Object>, method: &StringName) -> bool {
         .call("get", &["call_local".to_variant(), false.to_variant()])
         .try_to::<bool>()
         .unwrap_or(false)
+}
+
+/// The scene a spawner lists at `index`, loaded.
+fn spawnable_scene(spawner: &Gd<MultiplayerSpawner>, index: u8) -> Option<Gd<PackedScene>> {
+    let listed = spawner.get_spawnable_scene(i32::from(index)).to_string();
+    ResourceLoader::singleton()
+        .load(listed.as_str())?
+        .try_cast::<PackedScene>()
+        .ok()
+}
+
+/// A method's `rpc_mode` from its script's config, or 0 if it is not an RPC.
+fn rpc_mode(object: &Gd<Object>, method: &StringName) -> i64 {
+    let Some(script) = object.get_script() else {
+        return 0;
+    };
+    let entry = script.get_rpc_config().call("get", &[method.to_variant()]);
+    if entry.is_nil() {
+        return 0;
+    }
+    entry
+        .call("get", &["rpc_mode".to_variant(), 0.to_variant()])
+        .try_to::<i64>()
+        .unwrap_or(0)
 }

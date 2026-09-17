@@ -51,6 +51,10 @@ fn the_field_shapes_are_the_scenes_property_lists() {
     // Read off the wire, then matched against the `.tscn` blocks rather than
     // the other way round.
     let robot = vec![Transform3D, Int, Vector3];
+    // A bullet, and also each player's BulletCache: both are bullet.tscn
+    // instances replicating only global_transform, so the wire cannot tell
+    // them apart by shape. The capture's BulletCache records are the ones
+    // addressed by path id (0x80000002, 0x80000003) rather than by spawn id.
     let bullet = vec![Transform3D];
     let player_server = vec![Transform3D, Transform3D, Vector2, Int];
     let player_input = vec![Vector3, Vector3, Vector3, Vector2, Bool, Bool];

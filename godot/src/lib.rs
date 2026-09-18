@@ -567,9 +567,15 @@ impl ReplicationApi {
     /// over the following ticks. Renumbering would break the peers already
     /// connected, whose caches hold the old ids.
     ///
-    /// The signals go out deferred, for the re-entrancy reason on
-    /// `peer_events`: a script's handler is free to call straight back into
-    /// this API, and `poll` still holds the borrow.
+    /// The signals go out synchronously, and that is load-bearing rather than
+    /// incidental. `level.gd` creates the joining client's player from
+    /// `peer_connected`, so emitting it deferred put that player's SPAWN a
+    /// tick behind the rest of the join -- after the first SYNC, where a stock
+    /// server sends it before. Emitting through `base_mut()` lets the
+    /// handler's `add_child` register the new node back into this same object
+    /// while `poll` is still on the stack, which is what `base_mut()` is for;
+    /// the panic that made the earlier version defer everything comes from
+    /// handlers reached any other way (see `peer_events`).
     fn track_peers(&mut self) {
         let events = std::mem::take(&mut *self.peer_events.borrow_mut());
         let local = self.get_unique_id();
@@ -598,12 +604,10 @@ impl ReplicationApi {
             } else {
                 "peer_disconnected"
             };
-            self.base_mut()
-                .call_deferred("emit_signal", &[signal.to_variant(), id.to_variant()]);
+            self.base_mut().emit_signal(signal, &[id.to_variant()]);
             // A client's link to the server counts as being connected to it.
             if connected && id == 1 && local != 1 {
-                self.base_mut()
-                    .call_deferred("emit_signal", &["connected_to_server".to_variant()]);
+                self.base_mut().emit_signal("connected_to_server", &[]);
             }
         }
     }
@@ -616,10 +620,13 @@ impl ReplicationApi {
     /// which this did while there was only ever one client -- would have left
     /// the first client resolving stale ids to the wrong nodes.
     ///
-    /// Ordering is a constraint in both directions. A spawn names its
-    /// spawner by path id, so that path must reach a peer first; and a path
-    /// *under* a spawned node cannot be resolved until that node's spawn has
-    /// reached the same peer. Both are checked per peer below.
+    /// Ordering is a constraint in both directions, which is why the passes
+    /// run announce, spawn, announce. A spawn names its spawner by path id, so
+    /// that path must reach a peer first; and a path *under* a spawned node
+    /// cannot be resolved until that node's spawn has reached the same peer,
+    /// so the second pass picks up what the first had to skip. Both are
+    /// checked per peer, and stock puts all of it in one tick -- a joining
+    /// client's whole world arrives before the first SYNC.
     fn send_to_peers(&mut self) {
         let local = self.get_unique_id();
         let peers: Vec<i32> = self.peers.clone();
@@ -657,7 +664,19 @@ impl ReplicationApi {
             self.path_id_of(spawner.upcast());
         }
 
-        // Paths first, except those under a spawn the peer has not had.
+        self.announce_paths(&peers);
+        self.send_spawns(&peers, local);
+        // Ids for the synchronizers no SPAWN listed, now that the spawns just
+        // sent have claimed theirs, and a second announcing pass for them and
+        // for anything else under a node this call spawned. Stock sends those
+        // in this same tick -- the two BulletCache paths land between the last
+        // SPAWN and the first SYNC -- and one pass left them a tick late.
+        self.register_owned_paths(local);
+        self.announce_paths(&peers);
+    }
+
+    /// Announces every path a peer can resolve and has not been sent.
+    fn announce_paths(&mut self, peers: &[i32]) {
         for index in 0..self.paths.len() {
             // A dead node's id is kept, so it is never handed out twice, but
             // it is never announced again. Bullets make this matter: each one
@@ -673,7 +692,7 @@ impl ReplicationApi {
             }) {
                 continue;
             }
-            for &peer_id in &peers {
+            for &peer_id in peers {
                 if self.paths[index].sent_to.contains(&peer_id) {
                     continue;
                 }
@@ -702,8 +721,11 @@ impl ReplicationApi {
                 self.announced += 1;
             }
         }
+    }
 
-        // Then spawns, for peers that have the spawner's path.
+    /// Sends a SPAWN to every peer that has the spawner's path and has not
+    /// been told about the node.
+    fn send_spawns(&mut self, peers: &[i32], local: i32) {
         for index in 0..self.spawned.len() {
             if self.spawned[index].remote || !self.spawned[index].node.is_instance_valid() {
                 continue;
@@ -715,7 +737,7 @@ impl ReplicationApi {
             let Some(spawner_id) = self.path_id_of(spawner.clone().upcast()) else {
                 continue;
             };
-            for &peer_id in &peers {
+            for &peer_id in peers {
                 if self.spawned[index].sent_to.contains(&peer_id) {
                     continue;
                 }
@@ -1258,7 +1280,6 @@ impl ReplicationApi {
     /// with bullets in the air, and the largest captured was 877 bytes.
     fn send_sync(&mut self) {
         let local = self.get_unique_id();
-        self.register_owned_paths(local);
         // Each record with the peers that can resolve the id it is addressed
         // by: those sent the SPAWN that listed it, or those that confirmed its
         // path. The two can differ per peer at any moment -- a client that

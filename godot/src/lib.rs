@@ -1,5 +1,5 @@
-//! A `MultiplayerAPIExtension` that will speak Godot's own replication
-//! protocol (plan.md DR-7).
+//! A `MultiplayerAPIExtension` that speaks Godot's own replication protocol
+//! (plan.md DR-7).
 //!
 //! # What this is for
 //!
@@ -10,25 +10,32 @@
 //! than usual: those files are the oracle the whole Fluorite port is measured
 //! against.
 //!
-//! # This version answers a question rather than playing a game
+//! # Where it has got to
 //!
-//! It installs, manages the peer, and reports what Godot hands it. It does not
-//! replicate anything yet.
+//! It plays the demo, as server or as client, against a stock Godot 4.5.2 on
+//! the other side of the socket -- all four pairings, and a server with two
+//! clients at once. At the wire its join sequence, packet sizes and RPC forms
+//! match a stock server's (`tools/net_corpus_diff.py`).
 //!
-//! That is deliberate. The crate beside this one already decodes and re-encodes
-//! real captured traffic byte for byte, so the *protocol* is not the unknown.
-//! What is unknown is the shape of the engine side: what `configuration`
-//! actually is when a synchronizer registers, what order registrations arrive
-//! in relative to spawns, and which of the nine virtuals the engine really
-//! calls during a session. Guessing at those and writing a full implementation
-//! against the guess is how the protocol work would have gone if the captures
-//! had not been taken first.
+//! What is not done: RPC arguments, which nothing in this demo sends, and
+//! per-peer visibility.
 //!
-//! So this prints what arrives, and the next version is written against that.
+//! # How it was built, and why that shape
 //!
-//! # What it found
+//! The first version of this file replicated nothing. It installed, managed
+//! the peer, and printed what the engine handed it.
 //!
-//! Running the shipping demo over this, headless, for ten seconds:
+//! That was deliberate. The crate beside this one already decodes and
+//! re-encodes real captured traffic byte for byte, so the *protocol* was never
+//! the unknown. What was unknown is the shape of the engine side: what
+//! `configuration` actually is when a synchronizer registers, what order
+//! registrations arrive in relative to spawns, and which of the nine virtuals
+//! the engine really calls during a session. Guessing at those and writing a
+//! full implementation against the guess is how the protocol work would have
+//! gone if the captures had not been taken first.
+//!
+//! Everything below is what that printing found, and the rest of the file is
+//! written against it rather than against an assumption.
 //!
 //! **`configuration` is the spawner or synchronizer node itself**, and
 //! `object` is the node being replicated. Registrations arrived as 12

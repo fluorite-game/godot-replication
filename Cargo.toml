@@ -7,8 +7,17 @@
 #                routes Godot's own spawners, synchronizers and @rpc calls
 #                through `replication`.
 #
-# The port is the third consumer and reaches `replication` over a C ABI rather
-# than being a member here.
+# A third consumer exists and is not a member here: the Fluorite port of the
+# game this was measured from implements the same protocol in Dart. That is
+# deliberate rather than an oversight. Binding this crate through FFI would put
+# a native artifact in front of `dart test` -- a build per platform, x64 and
+# arm64 both -- and take away headless testability, which is the property that
+# has caught most of that port's real bugs.
+#
+# The two implementations share the fixtures under `replication/tests/`, not
+# code. Two independent decoders checked against one corpus of engine-produced
+# bytes disagree loudly when either is wrong; one implementation behind an FFI
+# boundary has nothing to disagree with.
 #
 # Split so that the protocol can be worked on and tested without gdext in the
 # build: `cargo test -p godot_replication` needs no Godot and takes a moment,

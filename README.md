@@ -18,8 +18,21 @@ godot_replication = { git = "https://github.com/fluorite-game/godot-replication"
 
 | crate | what it is | depends on |
 | --- | --- | --- |
-| `godot_replication` | the protocol itself — Variant codec, RPC numbering, SYNC/SPAWN/path framing | `md-5`, nothing else |
-| `godot_replication_ext` | a `MultiplayerApiExtension` GDExtension that routes Godot's own spawners, synchronizers and `@rpc` calls through it | `godot` 0.5, `api-4-5` |
+| `replication/` | the protocol in Rust — Variant codec, RPC numbering, SYNC/SPAWN/path framing | `md-5`, nothing else |
+| `godot/` | a `MultiplayerApiExtension` GDExtension that routes Godot's own spawners, synchronizers and `@rpc` calls through it | `godot` 0.5, `api-4-5` |
+| `dart/` | the same protocol in Dart, plus ENet behind its own entry point | `crypto`, nothing else |
+
+The two implementations are deliberate, not duplication. They are held to one
+corpus -- `replication/tests/fixtures/`, which both suites read -- and two
+independent decoders checked against one set of engine-written bytes disagree
+loudly when either is wrong. A binding would have nothing to disagree with.
+
+It has already paid for itself: the Dart encoder inferred a container
+element's type from the Dart value, which cannot work when a `Vector2`, a
+`Color` and a `PackedFloat32Array` are all `List<double>`. It wrote an `Array`
+where the engine wrote a `Vector2`, in a sample whose every other byte
+matched. Both forms are well-formed and both decode without error; only the
+fixture said which was meant.
 
 The split is so the protocol can be worked on without gdext in the build:
 `cargo test -p godot_replication` needs no Godot and finishes instantly, where

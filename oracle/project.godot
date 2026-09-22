@@ -1,0 +1,19 @@
+; Minimal project, so the oracle needs a Godot binary and nothing else.
+;
+;   godot --headless --path oracle res://variant_oracle.tscn > types.txt
+;
+; No assets, no autoloads, no rendering: the only thing asked of the engine is
+; `var_to_bytes`, which is the script-visible side of the same `encode_variant`
+; the replication protocol uses.
+
+config_version=5
+
+[application]
+
+config/name="godot-replication oracle"
+run/main_scene="res://variant_oracle.tscn"
+config/features=PackedStringArray("4.5")
+
+[rendering]
+
+renderer/rendering_method="gl_compatibility"

@@ -184,6 +184,12 @@ fn how_much_of_the_codec_the_fixture_actually_exercises() {
                     Value::Vector2(_) => "Vector2",
                     Value::Vector3(_) => "Vector3",
                     Value::Transform3D(_) => "Transform3D",
+                    // The corpus is this demo's traffic, which carries six
+                    // types. The codec covers Godot's whole list now, so a
+                    // seventh appearing here means the capture changed, not
+                    // that the codec grew -- worth failing on rather than
+                    // counting under a catch-all.
+                    other => panic!("corpus carries an unexpected {other:?}"),
                 };
                 *types.entry(name).or_default() += 1;
             }

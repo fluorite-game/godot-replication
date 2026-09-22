@@ -1522,14 +1522,36 @@ impl ReplicationApi {
         Some(target.get_indexed(&property))
     }
 
-    /// Godot's Variant to the crate's, for the six types this demo replicates.
+    /// Godot's Variant to the crate's.
+    ///
+    /// `None` for the four types this crate refuses -- `Object`, `Callable`,
+    /// `Signal` and `RID` -- which encode a pointer or an instance id that
+    /// means nothing at the far end. Refusing them here is what keeps a
+    /// replication packet from becoming a deserialization primitive.
+    #[allow(clippy::too_many_lines)]
     fn convert(value: &Variant) -> Option<Value> {
         use godot::builtin::VariantType as T;
-        use godot::builtin::{Transform3D, Vector2, Vector3};
+        use godot::builtin::{
+            Aabb, Color, GString, NodePath as GNodePath, PackedByteArray, PackedColorArray,
+            PackedFloat32Array, PackedFloat64Array, PackedInt32Array, PackedInt64Array,
+            PackedStringArray, PackedVector2Array, PackedVector3Array, PackedVector4Array, Plane,
+            Projection, Quaternion, Rect2, Rect2i, StringName, Transform2D, Transform3D, Vector2,
+            Vector2i, Vector3, Vector3i, Vector4, Vector4i,
+        };
+        use godot_replication::variant::{NodePath as RNodePath, VariantType as K};
         Some(match value.get_type() {
+            T::NIL => Value::Nil,
             T::BOOL => Value::Bool(value.to::<bool>()),
             T::INT => Value::Int(value.to::<i64>()),
             T::FLOAT => Value::Float(value.to::<f64>()),
+            T::STRING => Value::Str {
+                kind: K::String,
+                text: value.to::<GString>().to_string(),
+            },
+            T::STRING_NAME => Value::Str {
+                kind: K::StringName,
+                text: value.to::<StringName>().to_string(),
+            },
             T::VECTOR2 => {
                 let v = value.to::<Vector2>();
                 Value::Vector2([v.x, v.y])
@@ -1537,6 +1559,96 @@ impl ReplicationApi {
             T::VECTOR3 => {
                 let v = value.to::<Vector3>();
                 Value::Vector3([v.x, v.y, v.z])
+            }
+            T::VECTOR4 => {
+                let v = value.to::<Vector4>();
+                Value::Float4 {
+                    kind: K::Vector4,
+                    v: [v.x, v.y, v.z, v.w],
+                }
+            }
+            T::RECT2 => {
+                let r = value.to::<Rect2>();
+                Value::Float4 {
+                    kind: K::Rect2,
+                    v: [r.position.x, r.position.y, r.size.x, r.size.y],
+                }
+            }
+            T::PLANE => {
+                let p = value.to::<Plane>();
+                Value::Float4 {
+                    kind: K::Plane,
+                    v: [p.normal.x, p.normal.y, p.normal.z, p.d],
+                }
+            }
+            T::QUATERNION => {
+                let q = value.to::<Quaternion>();
+                Value::Float4 {
+                    kind: K::Quaternion,
+                    v: [q.x, q.y, q.z, q.w],
+                }
+            }
+            T::COLOR => {
+                let c = value.to::<Color>();
+                Value::Float4 {
+                    kind: K::Color,
+                    v: [c.r, c.g, c.b, c.a],
+                }
+            }
+            T::VECTOR2I => {
+                let v = value.to::<Vector2i>();
+                Value::Ints {
+                    kind: K::Vector2i,
+                    v: vec![v.x, v.y],
+                }
+            }
+            T::VECTOR3I => {
+                let v = value.to::<Vector3i>();
+                Value::Ints {
+                    kind: K::Vector3i,
+                    v: vec![v.x, v.y, v.z],
+                }
+            }
+            T::VECTOR4I => {
+                let v = value.to::<Vector4i>();
+                Value::Ints {
+                    kind: K::Vector4i,
+                    v: vec![v.x, v.y, v.z, v.w],
+                }
+            }
+            T::RECT2I => {
+                let r = value.to::<Rect2i>();
+                Value::Ints {
+                    kind: K::Rect2i,
+                    v: vec![r.position.x, r.position.y, r.size.x, r.size.y],
+                }
+            }
+            T::TRANSFORM2D => {
+                let t = value.to::<Transform2D>();
+                Value::Float6 {
+                    kind: K::Transform2D,
+                    v: [t.a.x, t.a.y, t.b.x, t.b.y, t.origin.x, t.origin.y],
+                }
+            }
+            T::AABB => {
+                let a = value.to::<Aabb>();
+                Value::Float6 {
+                    kind: K::Aabb,
+                    v: [
+                        a.position.x,
+                        a.position.y,
+                        a.position.z,
+                        a.size.x,
+                        a.size.y,
+                        a.size.z,
+                    ],
+                }
+            }
+            T::BASIS => {
+                let r = value.to::<godot::builtin::Basis>().rows;
+                Value::Basis([
+                    r[0].x, r[0].y, r[0].z, r[1].x, r[1].y, r[1].z, r[2].x, r[2].y, r[2].z,
+                ])
             }
             T::TRANSFORM3D => {
                 let t = value.to::<Transform3D>();
@@ -1550,6 +1662,102 @@ impl ReplicationApi {
                     t.origin.x, t.origin.y, t.origin.z,
                 ])
             }
+            T::PROJECTION => {
+                let p = value.to::<Projection>();
+                let c = p.cols;
+                Value::Projection([
+                    c[0].x, c[0].y, c[0].z, c[0].w, c[1].x, c[1].y, c[1].z, c[1].w, c[2].x, c[2].y,
+                    c[2].z, c[2].w, c[3].x, c[3].y, c[3].z, c[3].w,
+                ])
+            }
+            T::NODE_PATH => {
+                // Round-tripped through the text form: gdext exposes the parts
+                // by index rather than as slices, and the string is what the
+                // engine itself parses.
+                let text = value.to::<GNodePath>().to_string();
+                let absolute = text.starts_with('/');
+                let (node_part, sub_part) = match text.split_once(':') {
+                    Some((n, s)) => (n, Some(s)),
+                    None => (text.as_str(), None),
+                };
+                Value::NodePath(RNodePath {
+                    names: node_part
+                        .trim_start_matches('/')
+                        .split('/')
+                        .filter(|s| !s.is_empty())
+                        .map(str::to_string)
+                        .collect(),
+                    subnames: sub_part
+                        .map(|s| s.split(':').map(str::to_string).collect())
+                        .unwrap_or_default(),
+                    absolute,
+                })
+            }
+            T::DICTIONARY => {
+                let dict = value.to::<Dictionary<Variant, Variant>>();
+                let mut pairs = Vec::with_capacity(dict.len());
+                for (k, v) in &dict {
+                    pairs.push((Self::convert(&k)?, Self::convert(&v)?));
+                }
+                Value::Dictionary(pairs)
+            }
+            T::ARRAY => {
+                let array = value.to::<godot::builtin::Array<Variant>>();
+                let mut items = Vec::with_capacity(array.len());
+                for item in array.iter_shared() {
+                    items.push(Self::convert(&item)?);
+                }
+                Value::Array(items)
+            }
+            T::PACKED_BYTE_ARRAY => Value::Bytes(value.to::<PackedByteArray>().to_vec()),
+            T::PACKED_INT32_ARRAY => Value::Int32s(value.to::<PackedInt32Array>().to_vec()),
+            T::PACKED_INT64_ARRAY => Value::Int64s(value.to::<PackedInt64Array>().to_vec()),
+            T::PACKED_FLOAT32_ARRAY => Value::Float32s(value.to::<PackedFloat32Array>().to_vec()),
+            T::PACKED_FLOAT64_ARRAY => Value::Float64s(value.to::<PackedFloat64Array>().to_vec()),
+            T::PACKED_STRING_ARRAY => Value::Strings(
+                value
+                    .to::<PackedStringArray>()
+                    .to_vec()
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect(),
+            ),
+            T::PACKED_VECTOR2_ARRAY => Value::Vectors {
+                kind: K::PackedVector2Array,
+                v: value
+                    .to::<PackedVector2Array>()
+                    .to_vec()
+                    .iter()
+                    .flat_map(|e| [e.x, e.y])
+                    .collect(),
+            },
+            T::PACKED_VECTOR3_ARRAY => Value::Vectors {
+                kind: K::PackedVector3Array,
+                v: value
+                    .to::<PackedVector3Array>()
+                    .to_vec()
+                    .iter()
+                    .flat_map(|e| [e.x, e.y, e.z])
+                    .collect(),
+            },
+            T::PACKED_COLOR_ARRAY => Value::Vectors {
+                kind: K::PackedColorArray,
+                v: value
+                    .to::<PackedColorArray>()
+                    .to_vec()
+                    .iter()
+                    .flat_map(|e| [e.r, e.g, e.b, e.a])
+                    .collect(),
+            },
+            T::PACKED_VECTOR4_ARRAY => Value::Vectors {
+                kind: K::PackedVector4Array,
+                v: value
+                    .to::<PackedVector4Array>()
+                    .to_vec()
+                    .iter()
+                    .flat_map(|e| [e.x, e.y, e.z, e.w])
+                    .collect(),
+            },
             _ => return None,
         })
     }
@@ -1615,14 +1823,53 @@ fn resolve(object: &Gd<Object>, path: &NodePath) -> Option<(Gd<Object>, NodePath
 }
 
 /// The crate's Variant back to Godot's.
+///
+/// Long because it is one arm per type; see `variant.rs` for why that is not
+/// split up. The `Float4` and `Float6` arms fan out on the kind they carry,
+/// because four floats are a `Rect2`, a `Plane`, a `Quaternion`, a `Color` or
+/// a `Vector4` depending only on the id that travelled with them.
+#[allow(clippy::too_many_lines)]
 fn to_variant(value: &Value) -> Variant {
-    use godot::builtin::{Basis, Transform3D, Vector2, Vector3};
-    match *value {
+    use godot::builtin::{
+        Aabb, Basis, Color, GString, PackedByteArray, PackedColorArray, PackedFloat32Array,
+        PackedFloat64Array, PackedInt32Array, PackedInt64Array, PackedStringArray,
+        PackedVector2Array, PackedVector3Array, PackedVector4Array, Plane, Projection, Quaternion,
+        Rect2, Rect2i, StringName, Transform2D, Transform3D, Vector2, Vector2i, Vector3, Vector3i,
+        Vector4, Vector4i,
+    };
+    use godot_replication::variant::VariantType as K;
+    match value {
+        Value::Nil => Variant::nil(),
         Value::Bool(v) => v.to_variant(),
         Value::Int(v) => v.to_variant(),
         Value::Float(v) => v.to_variant(),
-        Value::Vector2([x, y]) => Vector2::new(x, y).to_variant(),
-        Value::Vector3([x, y, z]) => Vector3::new(x, y, z).to_variant(),
+        Value::Str { kind, text } => match kind {
+            K::StringName => StringName::from(text.as_str()).to_variant(),
+            _ => GString::from(text.as_str()).to_variant(),
+        },
+        Value::Vector2([x, y]) => Vector2::new(*x, *y).to_variant(),
+        Value::Vector3([x, y, z]) => Vector3::new(*x, *y, *z).to_variant(),
+        Value::Float4 { kind, v } => match kind {
+            K::Rect2 => Rect2::new(Vector2::new(v[0], v[1]), Vector2::new(v[2], v[3])).to_variant(),
+            K::Plane => Plane::new(Vector3::new(v[0], v[1], v[2]), v[3]).to_variant(),
+            K::Quaternion => Quaternion::new(v[0], v[1], v[2], v[3]).to_variant(),
+            K::Color => Color::from_rgba(v[0], v[1], v[2], v[3]).to_variant(),
+            _ => Vector4::new(v[0], v[1], v[2], v[3]).to_variant(),
+        },
+        Value::Float6 { kind, v } => match kind {
+            K::Aabb => Aabb::new(
+                Vector3::new(v[0], v[1], v[2]),
+                Vector3::new(v[3], v[4], v[5]),
+            )
+            .to_variant(),
+            _ => Transform2D::from_cols(
+                Vector2::new(v[0], v[1]),
+                Vector2::new(v[2], v[3]),
+                Vector2::new(v[4], v[5]),
+            )
+            .to_variant(),
+        },
+        Value::Basis(m) => basis_from_rows(m).to_variant(),
         Value::Transform3D(m) => Transform3D::new(
             // Row-major, the order the encoder writes.
             Basis::from_rows(
@@ -1633,7 +1880,112 @@ fn to_variant(value: &Value) -> Variant {
             Vector3::new(m[9], m[10], m[11]),
         )
         .to_variant(),
+        Value::Projection(m) => Projection::from_cols(
+            Vector4::new(m[0], m[1], m[2], m[3]),
+            Vector4::new(m[4], m[5], m[6], m[7]),
+            Vector4::new(m[8], m[9], m[10], m[11]),
+            Vector4::new(m[12], m[13], m[14], m[15]),
+        )
+        .to_variant(),
+        Value::Ints { kind, v } => match kind {
+            K::Vector2i => Vector2i::new(v[0], v[1]).to_variant(),
+            K::Vector3i => Vector3i::new(v[0], v[1], v[2]).to_variant(),
+            K::Rect2i => {
+                Rect2i::new(Vector2i::new(v[0], v[1]), Vector2i::new(v[2], v[3])).to_variant()
+            }
+            _ => Vector4i::new(v[0], v[1], v[2], v[3]).to_variant(),
+        },
+        Value::NodePath(path) => NodePath::from(node_path_string(path).as_str()).to_variant(),
+        Value::Dictionary(pairs) => {
+            let mut dict = Dictionary::<Variant, Variant>::new();
+            for (k, v) in pairs {
+                dict.set(&to_variant(k), &to_variant(v));
+            }
+            dict.to_variant()
+        }
+        Value::Array(items) => {
+            let mut array = godot::builtin::Array::<Variant>::new();
+            for item in items {
+                array.push(&to_variant(item));
+            }
+            array.to_variant()
+        }
+        Value::Bytes(v) => PackedByteArray::from(v.as_slice()).to_variant(),
+        Value::Int32s(v) => PackedInt32Array::from(v.as_slice()).to_variant(),
+        Value::Int64s(v) => PackedInt64Array::from(v.as_slice()).to_variant(),
+        Value::Float32s(v) => PackedFloat32Array::from(v.as_slice()).to_variant(),
+        Value::Float64s(v) => PackedFloat64Array::from(v.as_slice()).to_variant(),
+        Value::Strings(v) => {
+            let owned: Vec<GString> = v.iter().map(|s| GString::from(s.as_str())).collect();
+            PackedStringArray::from(owned.as_slice()).to_variant()
+        }
+        Value::Vectors { kind, v } => match kind {
+            K::PackedVector2Array => {
+                let items: Vec<Vector2> = v
+                    .as_chunks::<2>()
+                    .0
+                    .iter()
+                    .map(|c| Vector2::new(c[0], c[1]))
+                    .collect();
+                PackedVector2Array::from(items.as_slice()).to_variant()
+            }
+            K::PackedVector3Array => {
+                let items: Vec<Vector3> = v
+                    .as_chunks::<3>()
+                    .0
+                    .iter()
+                    .map(|c| Vector3::new(c[0], c[1], c[2]))
+                    .collect();
+                PackedVector3Array::from(items.as_slice()).to_variant()
+            }
+            K::PackedColorArray => {
+                let items: Vec<Color> = v
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .map(|c| Color::from_rgba(c[0], c[1], c[2], c[3]))
+                    .collect();
+                PackedColorArray::from(items.as_slice()).to_variant()
+            }
+            _ => {
+                let items: Vec<Vector4> = v
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .map(|c| Vector4::new(c[0], c[1], c[2], c[3]))
+                    .collect();
+                PackedVector4Array::from(items.as_slice()).to_variant()
+            }
+        },
     }
+}
+
+/// Nine row-major floats as a `Basis`.
+fn basis_from_rows(m: &[f32; 9]) -> godot::builtin::Basis {
+    use godot::builtin::{Basis, Vector3};
+    Basis::from_rows(
+        Vector3::new(m[0], m[1], m[2]),
+        Vector3::new(m[3], m[4], m[5]),
+        Vector3::new(m[6], m[7], m[8]),
+    )
+}
+
+/// A decoded `NodePath` back into the text form Godot parses.
+///
+/// `/root/Level` is absolute with two names; `Player:position:x` is one name
+/// and two subnames. Rebuilt rather than carried as a string, because the
+/// structure is what came off the wire and the text is a rendering of it.
+fn node_path_string(path: &godot_replication::variant::NodePath) -> String {
+    let mut out = String::new();
+    if path.absolute {
+        out.push('/');
+    }
+    out.push_str(&path.names.join("/"));
+    for sub in &path.subnames {
+        out.push(':');
+        out.push_str(sub);
+    }
+    out
 }
 
 /// The SceneTree root, which remote paths are relative to.

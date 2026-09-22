@@ -31,10 +31,15 @@ This implements the subset that appeared in the traffic it was measured from.
 That subset is smaller than Godot's, and the gaps are sharp edges rather than
 gentle degradation:
 
-* **Variant types.** `bool`, `int`, `float`, `String`, `Vector3`,
-  `Transform3D`. Anything else decodes to `VariantError::UnknownType`. There is
-  no guessing past it: an unknown type has an unknown length, so continuing
-  would turn one unreadable value into an unreadable packet.
+* **Variant types: all of them but four.** Every id from `Nil` through
+  `PackedVector4Array` round-trips against bytes the engine wrote. The four
+  refused are `Object`, `Callable`, `Signal` and `RID`, which encode a pointer
+  or an instance id that means nothing at the far end; `var_to_bytes` writes
+  them only with `full_objects` set, and a replication protocol that accepted
+  them would be handing a remote peer a deserialization primitive. They decode
+  to `VariantError::UnknownType`, and there is no guessing past it: an unknown
+  type has an unknown length, so continuing would turn one unreadable value
+  into an unreadable packet.
 * **RPC arguments are not implemented.** Method ids, the config hash and the
   call framing are; an argument list is not, because no captured packet had
   one. A call with arguments is refused rather than silently truncated.
@@ -59,6 +64,20 @@ byte somebody watched arrive, and the fixtures under
 
 `cargo test -p godot_replication` re-encodes every captured packet and asserts
 it reproduces byte for byte.
+
+For the Variant codec the ground truth is regenerable rather than only
+captured. `oracle/` is a minimal Godot project -- no assets, no autoloads --
+that calls `var_to_bytes()` over every type at two values each, one zero and
+one whose every field differs:
+
+```
+godot --headless --path oracle res://variant_oracle.tscn
+```
+
+Its output is `replication/tests/fixtures/variant_types.hex`, and the tests
+assert that decoding consumes exactly the bytes the engine wrote -- not fewer,
+which in a packet would leave the next field reading its header from the wrong
+offset.
 
 The capture harness itself — the scripts that drive two peers, dump the corpus
 and diff one implementation's traffic against stock Godot's — lives with the

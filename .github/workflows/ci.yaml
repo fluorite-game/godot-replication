@@ -20,3 +20,18 @@ jobs:
       # Re-encodes every captured packet and asserts it reproduces byte for
       # byte. If this fails, either the codec changed or the corpus did.
       - run: cargo test -p godot_replication
+
+  dart:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dart-lang/setup-dart@v1
+      - run: dart pub get
+        working-directory: dart
+      - run: dart analyze
+        working-directory: dart
+      # Reads ../replication/tests/fixtures -- the same bytes the Rust suite
+      # asserts against. Two implementations, one corpus: if they disagree
+      # about the wire, one of these two jobs fails and the fixture says which.
+      - run: dart test
+        working-directory: dart

@@ -1,0 +1,16 @@
+name: godot_replication
+description: >-
+  Godot 4.5's high-level multiplayer protocol -- Variant codec, RPC numbering,
+  SYNC/SPAWN/path framing and an ENet transport -- measured off the wire.
+version: 0.1.0
+publish_to: none
+
+environment:
+  sdk: ^3.5.0
+
+dependencies:
+  crypto: ^3.0.0
+
+dev_dependencies:
+  lints: ^5.0.0
+  test: ^1.25.0

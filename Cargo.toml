@@ -1,4 +1,4 @@
-# Two crates, one protocol implementation (plan.md DR-7).
+# Two crates, one protocol implementation.
 #
 #   replication  the protocol itself: codec, RPC numbering, SYNC framing.
 #                No engine, no transport, no dependencies beyond MD5, so it

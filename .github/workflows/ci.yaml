@@ -1,0 +1,22 @@
+# The protocol crate only. `godot_replication_ext` needs gdext and a matching
+# engine, which is a multi-minute build and a second set of pins; it is checked
+# by the game that consumes it rather than here.
+name: ci
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - run: cargo fmt -p godot_replication -- --check
+      - run: cargo clippy -p godot_replication --all-targets -- -D warnings
+      # Re-encodes every captured packet and asserts it reproduces byte for
+      # byte. If this fails, either the codec changed or the corpus did.
+      - run: cargo test -p godot_replication

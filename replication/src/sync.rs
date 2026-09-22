@@ -21,7 +21,7 @@
 //! was one of them -- it was right, and failed anyway, because the *bodies*
 //! were being read as plain four-byte-header Variants when SYNC carries the
 //! compact form. Rather than try a third layout against packets whose contents
-//! were unknown, `tools/capture_sync_probe.sh` put two peers on one node with
+//! were unknown, the sync probe (two peers, one replicated property) put two peers on one node with
 //! one property and a value unmistakable in a hex dump, and the framing could
 //! then be read instead of searched for.
 //!
@@ -164,7 +164,7 @@ pub fn parse(packet: &[u8]) -> Result<SyncPacket, SyncError> {
 /// *streams* are `state` and `current_animation`, both small enums. Its one
 /// large int, `player_id`, is replication mode 0 and rides the spawn packet,
 /// so a SYNC stream from this demo can never carry a wider one. Codes 1 to 3
-/// are pinned instead by `tools/capture_sync_probe.sh`, which replicated an
+/// are pinned instead by the sync probe (two peers, one replicated property), which replicated an
 /// int of each magnitude on purpose, and those bytes are quoted in
 /// `variant`'s unit tests.
 #[must_use]

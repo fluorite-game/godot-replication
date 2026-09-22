@@ -1,4 +1,4 @@
-; Makes Godot load the replication extension (plan.md DR-7).
+; Makes Godot load the replication extension.
 ;
 ; The library path points into the workspace's build output, which is
 ; gitignored: this is a development manifest, not a shipping one. A shipping
@@ -14,7 +14,7 @@
 ;   echo res://net/godot/replication.gdextension > .godot/extension_list.cfg
 ;
 ; Without it the extension silently does not load and `ClassDB.class_exists`
-; returns false, which is what `tools/replication_ext_probe.gd` checks first.
+; returns false, which is what an extension probe checks first.
 
 [configuration]
 entry_symbol = "gdext_rust_init"

@@ -1,5 +1,4 @@
-//! A `MultiplayerAPIExtension` that speaks Godot's own replication protocol
-//! (plan.md DR-7).
+//! A `MultiplayerAPIExtension` that speaks Godot's own replication protocol.
 //!
 //! # What this is for
 //!
@@ -15,7 +14,8 @@
 //! It plays the demo, as server or as client, against a stock Godot 4.5.2 on
 //! the other side of the socket -- all four pairings, and a server with two
 //! clients at once. At the wire its join sequence, packet sizes and RPC forms
-//! match a stock server's (`tools/net_corpus_diff.py`).
+//! match a stock server's, compared packet by packet against a capture of
+//! one.
 //!
 //! What is not done: RPC arguments, which nothing in this demo sends, and
 //! per-peer visibility.
@@ -285,7 +285,7 @@ impl IMultiplayerApiExtension for ReplicationApi {
             // one gap at a time.
             //
             // It is also the same fact the port arrived at from the other
-            // direction: `tools/offline_authority_probe.gd` measured that an
+            // direction: an offline-authority probe measured that an
             // offline Godot reports is_server true and unique_id 1, which is
             // what LoopbackAuthority was built to reproduce (DR-1).
             peer: Some(OfflineMultiplayerPeer::new_gd().upcast()),

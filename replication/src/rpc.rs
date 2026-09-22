@@ -281,7 +281,7 @@ mod tests {
     use super::*;
 
     /// The demo's five configs, in declaration order as the `.gd` files write
-    /// them. Read out of the engine by `tools/rpc_config_oracle.gd`.
+    /// them. Read out of the engine by an RPC-config oracle run inside Godot.
     fn player() -> RpcConfig {
         RpcConfig::new(["jump", "land", "shoot", "hit", "add_camera_shake_trauma"])
     }

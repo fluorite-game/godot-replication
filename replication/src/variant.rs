@@ -14,7 +14,7 @@
 //!
 //! # Measured values
 //!
-//! Plain form, from `tools/variant_wire_oracle.gd` calling `var_to_bytes()`:
+//! Plain form, from a wire oracle run inside Godot calling `var_to_bytes()`:
 //!
 //! ```text
 //! bool false      0100000000000000
@@ -26,7 +26,7 @@
 //! Transform3D     12000000 + 12 floats
 //! ```
 //!
-//! Compact form, from `tools/capture_sync_probe.sh` replicating one property:
+//! Compact form, from the sync probe (two peers, one replicated property) replicating one property:
 //!
 //! ```text
 //! bool false      01            bit 7 is the value
@@ -407,8 +407,8 @@ mod tests {
     }
 
     // Every expected string below was printed by `var_to_bytes()` in
-    // tools/variant_wire_oracle.gd, or read out of a capture taken by
-    // tools/capture_sync_probe.sh. None was computed by this crate.
+    // that oracle, or read out of a capture taken by
+    // the sync probe. None was computed by this crate.
 
     #[test]
     fn plain_form_matches_the_engine() {

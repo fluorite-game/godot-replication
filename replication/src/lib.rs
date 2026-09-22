@@ -2,10 +2,14 @@
 //!
 //! # Why this exists
 //!
-//! The Fluorite port of Godot's TPS demo has to play against a *stock,
-//! unmodified* Godot build (plan.md DR-7). That means speaking
-//! `SceneMultiplayer`'s protocol, which is an engine internal: undocumented,
-//! and with no promise of stability between releases.
+//! A program that is not Godot has to play against a *stock, unmodified*
+//! Godot build. That means speaking `SceneMultiplayer`'s protocol, which is an
+//! engine internal: undocumented, and with no promise of stability between
+//! releases.
+//!
+//! This began as the networking half of a Fluorite port of Godot's TPS demo,
+//! which is where the captures come from and why the covered subset is the
+//! shape it is. See README.md for what is and is not implemented.
 //!
 //! Rather than implement it twice -- once in Dart for the port and once in
 //! `GDScript` for the Godot side -- it is implemented here once and compiled
@@ -16,10 +20,10 @@
 //! # Everything here was measured, not read
 //!
 //! No part of this was taken from engine source or documentation. It comes
-//! from captures in `/mnt/dev/tps-demo-perf/net-corpus`, produced by
-//! `tools/capture_net.sh` (two peers playing the real demo) and
-//! `tools/capture_sync_probe.sh` (two peers replicating one known value), and
-//! read by `tools/net_corpus_report.py` and `tools/sync_frame_report.py`.
+//! from packet captures of two peers playing the real demo, and of two peers
+//! replicating one known value so that a single field could be isolated. The
+//! bytes are under `tests/fixtures/`; the harness that produced them lives
+//! with the game it was built for and is not part of this repository.
 //!
 //! That matters because of how this fails. A field decoded one byte out of
 //! place yields a plausible number rather than an error, and a wrong RPC id is

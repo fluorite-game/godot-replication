@@ -179,24 +179,19 @@ Uint8List encodeSync(final SyncPacket packet) {
 /// bool and int take the one-byte header; everything else falls back to the
 /// four-byte one, which is what `encode_and_compress_variant` does.
 Uint8List encodeCompactField(final VariantType type, final Object? value) {
+  // bool and int are the only two the compact form covers; everything else
+  // keeps the plain four-byte header, which is what
+  // `encode_and_compress_variant` does.
   switch (type) {
     case VariantType.bool$:
       return encodeCompactBool(value! as bool);
     case VariantType.int$:
       return encodeCompactInt(value! as int);
-    case VariantType.float$:
-      return encodeDouble(value! as double);
-    case VariantType.vector2:
-      final List<double> v = value! as List<double>;
-      return encodeVector2(v[0], v[1]);
-    case VariantType.vector3:
-      final List<double> v = value! as List<double>;
-      return encodeVector3(v[0], v[1], v[2]);
-    case VariantType.transform3d:
-      final List<double> v = value! as List<double>;
-      return encodeTransform3D(v.sublist(0, 9), v.sublist(9, 12));
+    default:
+      return encodeVariantValue(type, value);
   }
 }
+
 
 /// A [FieldSink] that writes the wire form.
 ///

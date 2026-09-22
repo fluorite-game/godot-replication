@@ -39,7 +39,9 @@ fn the_calls_name_the_methods_the_capture_should_contain() {
         match RemoteCall::parse(&packet).expect("parses") {
             // Cache id 5 is `main/Level/SpawnedNodes/466750851` -- the client's
             // own player -- as SIMPLIFY_PATH announced it.
-            RemoteCall::Cached { cache_id, method } => {
+            RemoteCall::Cached {
+                cache_id, method, ..
+            } => {
                 assert_eq!(cache_id, 5);
                 *named
                     .entry(player.method_of(method.into()).expect("a player method"))

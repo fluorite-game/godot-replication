@@ -438,7 +438,7 @@ impl IMultiplayerApiExtension for ReplicationApi {
             // "Failed to get path from RPC: main/Level/SpawnedNodes/<peer>"
             // followed by "Requested node was not found".
             self.send_to_peers();
-            self.send_rpc(peer, &target, &method);
+            self.send_rpc(peer, &target, &method, &args);
         }
         // `call_local` is this API's job, not the engine's. A custom
         // MultiplayerAPI that only sends leaves the local half undone -- and
@@ -1218,17 +1218,23 @@ impl ReplicationApi {
                 return;
             }
         };
-        let (node, method_id) = match &call {
-            RemoteCall::Cached { cache_id, method } => (
+        let (node, method_id, args) = match &call {
+            RemoteCall::Cached {
+                cache_id,
+                method,
+                args,
+            } => (
                 self.remote_paths
                     .iter()
                     .find(|(p, i, _)| *p == from && *i == u32::from(*cache_id))
                     .map(|(_, _, n)| n.clone()),
                 *method,
+                args,
             ),
-            RemoteCall::Path { method, path } => (
+            RemoteCall::Path { method, path, args } => (
                 scene_root().and_then(|r| r.get_node_or_null(&NodePath::from(path.as_str()))),
                 *method,
+                args,
             ),
         };
         let Some(node) = node else {
@@ -1260,7 +1266,15 @@ impl ReplicationApi {
         {
             let _reentrant = self.base_mut();
             let mut target = node.upcast::<Object>();
-            target.callv(&method, &VarArray::new());
+            // The arguments as they arrived. `callv` takes a Godot array, so
+            // each one goes back through the same conversion the outbound side
+            // uses -- a type this crate cannot represent never reached here,
+            // because parsing would have refused the packet first.
+            let mut call_args = VarArray::new();
+            for arg in args {
+                call_args.push(&to_variant(arg));
+            }
+            target.callv(&method, &call_args);
         }
         self.remote_sender = 0;
     }
@@ -1369,7 +1383,13 @@ impl ReplicationApi {
     ///
     /// The method id is the index in the script's sorted RPC names. Arguments
     /// are not encoded -- nothing in this demo sends any.
-    fn send_rpc(&mut self, peer_id: i32, target: &Gd<Object>, method: &StringName) {
+    fn send_rpc(
+        &mut self,
+        peer_id: i32,
+        target: &Gd<Object>,
+        method: &StringName,
+        args: &VarArray,
+    ) {
         let Ok(node) = target.clone().try_cast::<Node>() else {
             return;
         };
@@ -1397,6 +1417,20 @@ impl ReplicationApi {
         } else {
             vec![peer_id]
         };
+        // Converted once rather than per target. A type this crate cannot
+        // represent drops the call rather than sending it with the argument
+        // missing, which would be a call made with the wrong arguments.
+        let mut encoded_args = Vec::with_capacity(args.len());
+        for arg in args.iter_shared() {
+            let Some(value) = Self::convert(&arg) else {
+                godot_error!(
+                    "[replication] {method} has an argument this protocol cannot carry ({:?})",
+                    arg.get_type()
+                );
+                return;
+            };
+            encoded_args.push(value);
+        }
         for id in targets {
             let confirmed = self
                 .paths
@@ -1406,11 +1440,13 @@ impl ReplicationApi {
                 Ok(cache_id) if confirmed => RemoteCall::Cached {
                     cache_id,
                     method: method_id,
+                    args: encoded_args.clone(),
                 },
-                // The long form carries the path itself, at a fixed offset.
+                // The long form carries the path, after the arguments.
                 _ => RemoteCall::Path {
                     method: method_id,
                     path: path.clone(),
+                    args: encoded_args.clone(),
                 },
             };
             let bytes = call.encode();

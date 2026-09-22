@@ -30,6 +30,8 @@
 
 use md5::{Digest, Md5};
 
+use crate::variant::{decode_compact, encode_compact, Value};
+
 /// A remote call on the wire.
 ///
 /// # Two forms, and the lead byte says which
@@ -71,17 +73,35 @@ use md5::{Digest, Md5};
 /// Method 3 goes to the player once, which sorted is `land`: a character lands
 /// once after it spawns.
 ///
-/// # Arguments are not implemented, because nothing sends any
+/// # Arguments
 ///
-/// Every RPC this demo actually calls with `.rpc()` takes no parameters, and
-/// the one that takes a float -- `add_camera_shake_trauma` -- is only ever
-/// called as a plain method (`player.gd:201`, `:206`, `red_robot.gd:133`). So no
-/// captured packet carries an argument list, and there is nothing here to
-/// check an implementation of one against. Writing it now would be a guess
-/// with tests around it. [`RemoteCall::Path`] and [`RemoteCall::Cached`]
-/// therefore stop at the method id, and a packet with trailing bytes is
-/// refused rather than silently ignored.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// No captured packet carries one: every RPC the demo this was measured from
+/// actually calls takes no parameters. So the framing below was not read off a
+/// capture but asked of the engine directly -- `oracle/rpc_oracle.gd` installs
+/// a `MultiplayerPeerExtension`, which a stock `SceneMultiplayer` encodes into
+/// exactly as it would a socket, and dumps what it was handed.
+///
+/// The lead byte is two flags over one command:
+///
+/// ```text
+///   0x80  cached, no arguments   [80][cache id][method]
+///   0x00  cached, with arguments [00][cache id][method][u8 count][args...]
+///   0xa0  path,   no arguments   [a0][u32 offset|flag][method][path...]
+///   0x20  path,   with arguments [20][u32 offset|flag][method][u8 count][args...][path...]
+/// ```
+///
+/// Bit `0x20` says the target travels as a path rather than a cache id, and
+/// bit `0x80` says there are no arguments. The offset field exists because in
+/// the long form the path sits *after* the arguments, so its start cannot be
+/// a constant once there are any.
+///
+/// Arguments are encoded in the compact Variant form -- the same one SYNC
+/// uses, where a `bool` or a small `int` gets a one-byte header and everything
+/// else keeps the plain four-byte one.
+// Not `Eq`: an argument can be a float, and two calls differing only in a NaN
+// argument are not equal to themselves either. `PartialEq` is what the wire
+// comparison actually needs.
+#[derive(Debug, Clone, PartialEq)]
 pub enum RemoteCall {
     /// Addressed by a path-cache id the receiver has confirmed.
     Cached {
@@ -89,6 +109,8 @@ pub enum RemoteCall {
         cache_id: u8,
         /// Index into the node's sorted RPC method list.
         method: u8,
+        /// The call's arguments, in order.
+        args: Vec<Value>,
     },
     /// Addressed by full path, before the cache is confirmed.
     Path {
@@ -96,13 +118,23 @@ pub enum RemoteCall {
         method: u8,
         /// The node's path.
         path: String,
+        /// The call's arguments, in order.
+        args: Vec<Value>,
     },
 }
 
-/// Lead byte of a cached remote call.
+/// Lead byte of a cached remote call with no arguments.
 pub const LEAD_CACHED: u8 = 0x80;
-/// Lead byte of a remote call carrying its target's path.
+/// Lead byte of a remote call carrying its target's path, with no arguments.
 pub const LEAD_PATH: u8 = 0xa0;
+/// Lead byte of a cached remote call that carries arguments.
+pub const LEAD_CACHED_ARGS: u8 = 0x00;
+/// Lead byte of a path-addressed remote call that carries arguments.
+pub const LEAD_PATH_ARGS: u8 = 0x20;
+/// The lead bit that means the target travels as a path, not a cache id.
+pub const LEAD_BIT_PATH: u8 = 0x20;
+/// The lead bit that means no argument list follows the method id.
+pub const LEAD_BIT_NO_ARGS: u8 = 0x80;
 
 /// Where the path starts in a long-form call with no arguments.
 pub const PATH_OFFSET: u32 = 6;
@@ -122,13 +154,19 @@ pub enum CallError {
     Truncated,
     /// The path was not NUL-terminated.
     Unterminated,
-    /// The long form's path does not start straight after the method id.
+    /// The long form's path offset is not where the fields say it should be.
     ///
-    /// Anything between the method and the path would be an argument list,
-    /// which this crate does not implement.
+    /// The offset has to agree with the argument list that precedes it. A
+    /// packet whose offset points into the middle of an argument, or past the
+    /// end, is refused rather than read from the offset and hoped for.
     UnexpectedOffset {
         /// The field as read, flag included.
         field: u32,
+    },
+    /// An argument could not be decoded.
+    BadArgument {
+        /// Which argument, counting from zero.
+        index: usize,
     },
     /// Bytes followed the packet's last known field.
     ///
@@ -149,50 +187,72 @@ impl RemoteCall {
     ///
     /// Any of [`CallError`].
     pub fn parse(packet: &[u8]) -> Result<Self, CallError> {
-        match packet.first() {
-            Some(&LEAD_CACHED) => {
-                if packet.len() < 3 {
-                    return Err(CallError::Truncated);
-                }
-                if packet.len() > 3 {
-                    return Err(CallError::TrailingBytes {
-                        count: packet.len() - 3,
-                    });
-                }
-                Ok(Self::Cached {
-                    cache_id: packet[1],
-                    method: packet[2],
-                })
+        let lead = *packet.first().ok_or(CallError::Truncated)?;
+        // Anything outside the two flag bits is a command this is not.
+        if lead & !(LEAD_BIT_PATH | LEAD_BIT_NO_ARGS) != 0 {
+            return Err(CallError::UnknownForm { found: lead });
+        }
+        let by_path = lead & LEAD_BIT_PATH != 0;
+        let has_args = lead & LEAD_BIT_NO_ARGS == 0;
+
+        if by_path {
+            let field = u32::from_le_bytes(
+                packet
+                    .get(1..5)
+                    .ok_or(CallError::Truncated)?
+                    .try_into()
+                    .map_err(|_| CallError::Truncated)?,
+            );
+            if field & PATH_FLAG == 0 {
+                return Err(CallError::UnexpectedOffset { field });
             }
-            Some(&LEAD_PATH) => {
-                let field = u32::from_le_bytes(
-                    packet
-                        .get(1..5)
-                        .ok_or(CallError::Truncated)?
-                        .try_into()
-                        .map_err(|_| CallError::Truncated)?,
-                );
-                if field != PATH_FLAG | PATH_OFFSET {
-                    return Err(CallError::UnexpectedOffset { field });
-                }
-                let method = *packet.get(5).ok_or(CallError::Truncated)?;
-                let rest = packet.get(6..).ok_or(CallError::Truncated)?;
-                let end = rest
-                    .iter()
-                    .position(|&b| b == 0)
-                    .ok_or(CallError::Unterminated)?;
-                if end + 1 != rest.len() {
-                    return Err(CallError::TrailingBytes {
-                        count: rest.len() - end - 1,
-                    });
-                }
-                Ok(Self::Path {
-                    method,
-                    path: String::from_utf8_lossy(&rest[..end]).into_owned(),
-                })
+            let offset = (field & !PATH_FLAG) as usize;
+            let method = *packet.get(5).ok_or(CallError::Truncated)?;
+            let (args, after) = if has_args {
+                read_args(packet, 6)?
+            } else {
+                (Vec::new(), 6)
+            };
+            // The arguments have to end exactly where the path begins. An
+            // offset that disagrees means the two halves were read
+            // differently, and reading the path from the offset anyway would
+            // turn that into a call with the wrong arguments.
+            if after != offset {
+                return Err(CallError::UnexpectedOffset { field });
             }
-            Some(&found) => Err(CallError::UnknownForm { found }),
-            None => Err(CallError::Truncated),
+            let rest = packet.get(offset..).ok_or(CallError::Truncated)?;
+            let end = rest
+                .iter()
+                .position(|&b| b == 0)
+                .ok_or(CallError::Unterminated)?;
+            if end + 1 != rest.len() {
+                return Err(CallError::TrailingBytes {
+                    count: rest.len() - end - 1,
+                });
+            }
+            Ok(Self::Path {
+                method,
+                path: String::from_utf8_lossy(&rest[..end]).into_owned(),
+                args,
+            })
+        } else {
+            let cache_id = *packet.get(1).ok_or(CallError::Truncated)?;
+            let method = *packet.get(2).ok_or(CallError::Truncated)?;
+            let (args, after) = if has_args {
+                read_args(packet, 3)?
+            } else {
+                (Vec::new(), 3)
+            };
+            if after != packet.len() {
+                return Err(CallError::TrailingBytes {
+                    count: packet.len() - after,
+                });
+            }
+            Ok(Self::Cached {
+                cache_id,
+                method,
+                args,
+            })
         }
     }
 
@@ -200,17 +260,67 @@ impl RemoteCall {
     #[must_use]
     pub fn encode(&self) -> Vec<u8> {
         match self {
-            Self::Cached { cache_id, method } => vec![LEAD_CACHED, *cache_id, *method],
-            Self::Path { method, path } => {
-                let mut out = Vec::with_capacity(7 + path.len());
-                out.push(LEAD_PATH);
-                out.extend_from_slice(&(PATH_FLAG | PATH_OFFSET).to_le_bytes());
+            Self::Cached {
+                cache_id,
+                method,
+                args,
+            } => {
+                if args.is_empty() {
+                    return vec![LEAD_CACHED, *cache_id, *method];
+                }
+                let mut out = vec![LEAD_CACHED_ARGS, *cache_id, *method];
+                write_args(args, &mut out);
+                out
+            }
+            Self::Path { method, path, args } => {
+                let mut body = Vec::new();
+                if !args.is_empty() {
+                    write_args(args, &mut body);
+                }
+                let offset = 6 + body.len();
+                let mut out = Vec::with_capacity(offset + path.len() + 1);
+                out.push(if args.is_empty() {
+                    LEAD_PATH
+                } else {
+                    LEAD_PATH_ARGS
+                });
+                #[allow(clippy::cast_possible_truncation)]
+                let field = PATH_FLAG | offset as u32;
+                out.extend_from_slice(&field.to_le_bytes());
                 out.push(*method);
+                out.extend_from_slice(&body);
                 out.extend_from_slice(path.as_bytes());
                 out.push(0);
                 out
             }
         }
+    }
+}
+
+/// Reads `[u8 count][value; count]` from `at`, returning the values and the
+/// offset past them.
+fn read_args(packet: &[u8], at: usize) -> Result<(Vec<Value>, usize), CallError> {
+    let count = *packet.get(at).ok_or(CallError::Truncated)? as usize;
+    let mut args = Vec::with_capacity(count);
+    let mut off = at + 1;
+    for index in 0..count {
+        let (value, next) =
+            decode_compact(packet, off).map_err(|_| CallError::BadArgument { index })?;
+        args.push(value);
+        off = next;
+    }
+    Ok((args, off))
+}
+
+/// Writes `[u8 count][value; count]`.
+///
+/// The count is one byte, which is the engine's own limit rather than a
+/// simplification here: a call with more than 255 arguments cannot be
+/// expressed in this framing at all.
+fn write_args(args: &[Value], out: &mut Vec<u8>) {
+    out.push(u8::try_from(args.len()).unwrap_or(u8::MAX));
+    for arg in args {
+        out.extend_from_slice(&encode_compact(arg));
     }
 }
 

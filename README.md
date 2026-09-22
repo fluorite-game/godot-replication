@@ -40,9 +40,11 @@ gentle degradation:
   to `VariantError::UnknownType`, and there is no guessing past it: an unknown
   type has an unknown length, so continuing would turn one unreadable value
   into an unreadable packet.
-* **RPC arguments are not implemented.** Method ids, the config hash and the
-  call framing are; an argument list is not, because no captured packet had
-  one. A call with arguments is refused rather than silently truncated.
+* **RPC arguments are carried**, in all four framings: cached or
+  path-addressed, with arguments or without. No captured packet had one -- the
+  game this was measured from never calls an RPC with parameters -- so the
+  framing came from `oracle/rpc_oracle.gd` rather than from a capture or from
+  reading engine source.
 * **No compression and no fragmentation.** Neither appeared in 17266 captured
   packets, and the largest was 1057 bytes against a 1392-byte MTU.
 
@@ -78,6 +80,12 @@ Its output is `replication/tests/fixtures/variant_types.hex`, and the tests
 assert that decoding consumes exactly the bytes the engine wrote -- not fewer,
 which in a packet would leave the next field reading its header from the wrong
 offset.
+
+`oracle/rpc_oracle.gd` does the same for the call framing, by a different
+route: it installs a `MultiplayerPeerExtension`, which a stock
+`SceneMultiplayer` treats as a socket, so the engine encodes each RPC exactly
+as it would send it and hands the bytes over instead. One process, no network,
+no packet capture.
 
 The capture harness itself — the scripts that drive two peers, dump the corpus
 and diff one implementation's traffic against stock Godot's — lives with the
